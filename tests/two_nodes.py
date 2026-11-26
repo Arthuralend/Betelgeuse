@@ -11,10 +11,12 @@ import threading
 import time
 
 class Node:
-    def __init__(self, binary, directory, bootstrap=None):
+    def __init__(self, binary, directory, bootstrap=None, relay_server=False):
         args = [binary, "--data-dir", str(directory), "node", "start", "--server"]
         if bootstrap:
             args += ["--bootstrap", bootstrap]
+        if relay_server:
+            args += ["--relay-server"]
         self.process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, encoding="utf-8", bufsize=1)
         self.queue = queue.Queue()

@@ -35,6 +35,8 @@ enum Node {
         bootstrap: Vec<Multiaddr>,
         #[arg(long)]
         server: bool,
+        #[arg(long)]
+        relay_server: bool,
     },
 }
 
@@ -72,7 +74,7 @@ async fn main() -> Result<()> {
             let contact = Invitation::decode(&link)?.import(&mut store, &key.public().to_peer_id())?;
             emit(&json!({"contact":contact}))?;
         }
-        Action::Node { action: Node::Start { listen, bootstrap, server } } => {
+        Action::Node { action: Node::Start { listen, bootstrap, server, relay_server } } => {
             let key = identity::load(directory)?;
             let store = Store::open(directory)?;
             let (command_tx, command_rx) = mpsc::channel(64);
@@ -105,7 +107,7 @@ async fn main() -> Result<()> {
                 while let Some(event) = event_rx.recv().await { emit(&event)?; }
                 Ok::<_, anyhow::Error>(())
             });
-            let result = network::run(key, store, network::Config { listen, bootstrap, server }, command_rx, event_tx).await;
+            let result = network::run(key, store, network::Config { listen, bootstrap, server, relay_server }, command_rx, event_tx).await;
             input.abort();
             output.await.context("event writer failed")??;
             // Tokio's stdin uses a blocking thread. A terminal can remain open

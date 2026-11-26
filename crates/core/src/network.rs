@@ -6,9 +6,9 @@ use crate::{
 use anyhow::{ensure, Context, Result};
 use futures::StreamExt;
 use libp2p::{
-    identify, identity,
+    identify, identity, autonat, relay, dcutr,
     kad::{self, store::{MemoryStore, MemoryStoreConfig, RecordStore}},
-    multiaddr::Protocol, noise, ping, request_response, swarm::{NetworkBehaviour, SwarmEvent},
+    multiaddr::Protocol, noise, ping, request_response, swarm::{NetworkBehaviour, SwarmEvent, behaviour::toggle::Toggle},
     tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
 };
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,10 @@ struct Behaviour {
     identify: identify::Behaviour,
     messages: request_response::cbor::Behaviour<Message, Ack>,
     ping: ping::Behaviour,
+    relay_client: relay::client::Behaviour,
+    relay_server: Toggle<relay::Behaviour>,
+    dcutr: dcutr::Behaviour,
+    autonat: autonat::Behaviour,
 }
 
 #[derive(Debug, Deserialize)]
@@ -38,6 +42,8 @@ struct Behaviour {
 pub enum Command {
     Connect { address: String },
     Bootstrap,
+    ReserveRelay { address: String },
+    Announce { address: String },
     Put { name: Option<String> },
     PublishRoutes { addresses: Option<Vec<String>> },
     Get { peer: String, kind: Option<Kind> },
@@ -54,6 +60,7 @@ pub struct Config {
     pub listen: Vec<Multiaddr>,
     pub bootstrap: Vec<Multiaddr>,
     pub server: bool,
+    pub relay_server: bool,
 }
 
 struct Lookup {
@@ -76,7 +83,7 @@ struct Node {
 }
 
 impl Node {
-    fn new(key: identity::Keypair, store: Store, server: bool, events: mpsc::Sender<Value>) -> Result<Self> {
+    fn new(key: identity::Keypair, store: Store, server: bool, relay_server: bool, events: mpsc::Sender<Value>) -> Result<Self> {
         let peer = key.public().to_peer_id();
         let mut kconfig = kad::Config::new(StreamProtocol::new(DHT_PROTOCOL));
         kconfig.set_record_filtering(kad::StoreInserts::FilterBoth)
@@ -97,22 +104,27 @@ impl Node {
             .with_max_concurrent_streams(64);
         let codec = request_response::cbor::codec::Codec::default()
             .set_request_size_maximum(16_384).set_response_size_maximum(1024);
-        let behaviour = Behaviour {
-            kad,
-            identify: identify::Behaviour::new(identify::Config::new(
-                "/betelgeuse/1.0.0".into(), key.public()
-            )),
-            messages: request_response::cbor::Behaviour::with_codec(codec,
-                [(StreamProtocol::new(MESSAGE_PROTOCOL), request_response::ProtocolSupport::Full)],
-                message_config),
-            ping: ping::Behaviour::default(),
-        };
+        let public = key.public();
         let swarm = SwarmBuilder::with_existing_identity(key.clone())
             .with_tokio()
             .with_tcp(tcp::Config::default().nodelay(true), noise::Config::new, yamux::Config::default)?
             .with_quic()
             .with_dns()?
-            .with_behaviour(move |_| behaviour)?
+            .with_relay_client(noise::Config::new, yamux::Config::default)?
+            .with_behaviour(move |_, relay_client| Behaviour {
+            kad,
+            identify: identify::Behaviour::new(identify::Config::new(
+                "/betelgeuse/1.0.0".into(), public
+            )),
+            messages: request_response::cbor::Behaviour::with_codec(codec,
+                [(StreamProtocol::new(MESSAGE_PROTOCOL), request_response::ProtocolSupport::Full)],
+                message_config),
+            ping: ping::Behaviour::default(),
+            relay_client,
+            relay_server: Toggle::from(relay_server.then(|| relay::Behaviour::new(peer, relay::Config::default()))),
+            dcutr: dcutr::Behaviour::new(peer),
+            autonat: autonat::Behaviour::new(peer, autonat::Config::default()),
+        })?
             .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(120)))
             .build();
         Ok(Self { swarm, store, key, peer, lookups: HashMap::new(), publications: HashMap::new(),
@@ -134,11 +146,25 @@ impl Node {
         Ok(())
     }
 
+    fn reserve_relay(&mut self, address: Multiaddr) -> Result<()> {
+        ensure!(matches!(address.iter().last(), Some(Protocol::P2p(_))) &&
+            !address.iter().any(|part| part == Protocol::P2pCircuit), "relay address must end in /p2p/<relay PeerId>");
+        self.swarm.listen_on(address.with(Protocol::P2pCircuit))?;
+        Ok(())
+    }
+
+    fn normalize_listener(&self, mut address: Multiaddr) -> Multiaddr {
+        if matches!(address.iter().last(), Some(Protocol::P2p(peer)) if peer == self.peer) {
+            address.pop();
+        }
+        address
+    }
+
     fn addresses(&self, provided: Option<Vec<String>>) -> Result<Vec<Multiaddr>> {
         if let Some(addresses) = provided {
             return addresses.into_iter().map(|s| s.parse().map_err(anyhow::Error::from)).collect();
         }
-        Ok(self.swarm.listeners().take(8).cloned().collect())
+        Ok(self.swarm.listeners().take(8).cloned().map(|a| self.normalize_listener(a)).collect())
     }
 
     fn profile(&mut self, name: Option<String>) -> Result<SignedRecord> {
@@ -206,6 +232,15 @@ impl Node {
         match command {
             Command::Connect { address } => self.connect(address.parse()?)?,
             Command::Bootstrap => { self.swarm.behaviour_mut().kad.bootstrap()?; }
+            Command::ReserveRelay { address } => self.reserve_relay(address.parse()?)?,
+            Command::Announce { address } => {
+                let address = self.normalize_listener(address.parse()?);
+                // Explicit operator assertion, independently checked for shape.
+                let sequence = self.store.next_sequence(Kind::Routes, &self.peer)?;
+                SignedRecord::routes(&self.key, sequence, vec![address.clone()])?;
+                self.swarm.add_external_address(address);
+                self.emit(json!({"event":"announced"})).await?;
+            }
             Command::Put { name } => {
                 let data = self.profile(name)?;
                 self.publish(data)?;
@@ -359,11 +394,12 @@ impl Node {
     async fn on_event(&mut self, event: SwarmEvent<BehaviourEvent>) -> Result<()> {
         match event {
             SwarmEvent::NewListenAddr { address, .. } => {
-                let full = address.clone().with(Protocol::P2p(self.peer));
+                let full = self.normalize_listener(address).with(Protocol::P2p(self.peer));
                 self.emit(json!({"event":"listen","address":full.to_string()})).await?;
             }
-            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                self.emit(json!({"event":"connected","peer":peer_id.to_string()})).await?;
+            SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                self.emit(json!({"event":"connected","peer":peer_id.to_string(),
+                    "route":if endpoint.is_relayed() { "relay" } else { "direct" }})).await?;
                 if self.store.contact(&peer_id)?.is_some() { self.retry(peer_id)?; }
             }
             SwarmEvent::ConnectionClosed { peer_id, num_established:0, .. } => {
@@ -382,6 +418,15 @@ impl Node {
                     self.emit(json!({"event":"identified","peer":peer_id.to_string()})).await?;
                 }
             }
+            SwarmEvent::Behaviour(BehaviourEvent::RelayClient(relay::client::Event::ReservationReqAccepted { relay_peer_id, renewal, .. })) => {
+                self.emit(json!({"event":"relay_reserved","relay":relay_peer_id.to_string(),"renewal":renewal})).await?;
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Dcutr(event)) => {
+                self.emit(json!({"event":"direct_upgrade","peer":event.remote_peer_id.to_string(),"ok":event.result.is_ok()})).await?;
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Autonat(_)) => {
+                self.emit(json!({"event":"nat","status":format!("{:?}",self.swarm.behaviour().autonat.nat_status())})).await?;
+            }
             SwarmEvent::Behaviour(BehaviourEvent::Kad(event)) => self.on_kad(event).await?,
             SwarmEvent::Behaviour(BehaviourEvent::Messages(event)) => self.on_message(event).await?,
             _ => {}
@@ -392,7 +437,7 @@ impl Node {
 
 pub async fn run(key: identity::Keypair, store: Store, config: Config,
     mut commands: mpsc::Receiver<Command>, events: mpsc::Sender<Value>) -> Result<()> {
-    let mut node = Node::new(key, store, config.server, events)?;
+    let mut node = Node::new(key, store, config.server, config.relay_server, events)?;
     for address in config.listen { node.swarm.listen_on(address)?; }
     for address in config.bootstrap { node.connect(address)?; }
     node.emit(json!({"event":"started","peer":node.peer.to_string()})).await?;

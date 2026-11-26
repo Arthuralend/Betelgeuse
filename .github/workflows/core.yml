@@ -29,6 +29,8 @@ jobs:
         run: cargo build --locked -p betelgeuse
       - name: Run two independent peers and decode QR
         run: python3 tests/two_nodes.py --require-qr
+      - name: Three peers through Circuit Relay v2
+        run: python3 tests/relay_nodes.py
       - name: Package executable and lockfile
         run: cargo build --locked --release -p betelgeuse
       - uses: actions/upload-artifact@v4

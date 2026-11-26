@@ -154,8 +154,8 @@ fn validate_addresses(addresses: &[Multiaddr]) -> Result<()> {
     ensure!(!addresses.is_empty() && addresses.len() <= 8, "one to eight addresses required");
     for address in addresses {
         ensure!(address.to_vec().len() <= 256, "address too large");
-        // Accept direct TCP and QUIC addresses only in this version. The network
-        // supplies the expected PeerId separately when dialing.
+        // Accept direct TCP/QUIC and explicit Circuit Relay v2 routes. The
+        // destination peer identifier is supplied separately when dialing.
         let parts: Vec<_> = address.iter().collect();
         let valid_host = match parts.first() {
             Some(Protocol::Ip4(ip)) => !ip.is_unspecified() && !ip.is_multicast() && !ip.is_broadcast(),
@@ -166,6 +166,8 @@ fn validate_addresses(addresses: &[Multiaddr]) -> Result<()> {
         let valid_transport = match parts.as_slice() {
             [_, Protocol::Tcp(port)] => *port != 0,
             [_, Protocol::Udp(port), Protocol::QuicV1] => *port != 0,
+            [_, Protocol::Tcp(port), Protocol::P2p(_), Protocol::P2pCircuit] => *port != 0,
+            [_, Protocol::Udp(port), Protocol::QuicV1, Protocol::P2p(_), Protocol::P2pCircuit] => *port != 0,
             _ => false,
         };
         ensure!(valid_host && valid_transport, "unsupported or unroutable address");
