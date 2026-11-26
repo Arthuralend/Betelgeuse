@@ -28,4 +28,4 @@ BETELGEUSE_WEBRTC_FRAMEWORK="$framework" \
 BETELGEUSE_CORE_INCLUDE="$include" \
 BETELGEUSE_CORE_LIB="$root/target/aarch64-apple-ios/release/libbetelgeuse_mobile.a" \
   bash clients/ios/build.sh
-cp clients/ios/Betelgeuse-0.7.1-iPhone-unsigned.ipa dist/
+cp clients/ios/Betelgeuse-0.8.0-iPhone-unsigned.ipa dist/

@@ -8,6 +8,12 @@ import android.content.Intent;
 import android.graphics.Color;
 import android.os.Bundle;
 import android.net.Uri;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.widget.Switch;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
 import android.database.Cursor;
 import android.provider.OpenableColumns;
 import android.text.InputType;
@@ -34,6 +40,21 @@ import org.json.JSONObject;
 
 public final class RustActivity extends Activity {
     private RustCore core;
+    private boolean ready,foreground;
+    private int tcpPort;
+    private NearbyDiscovery nearby;
+    private ConnectivityManager connectivity;
+    private ConnectivityManager.NetworkCallback networkCallback;
+    private Network lastNetwork;
+    private Switch autoNetwork,nearbyEnabled;
+    private LinearLayout nearbyPanel,advancedPanel;
+    private TextView networkStatus,diagnostic;
+    private Button restartButton;
+    private final HashSet<String> knownContacts=new HashSet<>();
+    private final LinkedHashMap<String,JSONObject> pairOffers=new LinkedHashMap<>();
+    private String pairStatus="";
+    private String lanAddress="";
+    private boolean loadingPreferences;
     private RustRtc call;
     private EditText iceUrls,iceUser,icePassword;
     private LinearLayout callPanel, filePanel;
@@ -51,13 +72,13 @@ public final class RustActivity extends Activity {
     private final Runnable polling = new Runnable() {
         @Override public void run() {
             if (core == null) return;
-            for (int i = 0; i < 32; i++) {
+            for (int i = 0; i < 32 && core != null; i++) {
                 String text = core.poll();
                 if (text == null) break;
                 try { event(new JSONObject(text)); }
                 catch (Exception error) { status.setText(error.getMessage()); }
             }
-            handler.postDelayed(this, 120);
+            if (core != null) handler.postDelayed(this, 120);
         }
     };
 
@@ -72,23 +93,29 @@ public final class RustActivity extends Activity {
         scroll.addView(content);
         setContentView(scroll);
         TextView title = label("Бетельгейзе · P2P"); title.setTextSize(25); content.addView(title);
-        status = label("Запуск ядра…"); content.addView(status);
-        identity = label(""); identity.setTextIsSelectable(true); content.addView(identity);
-        button(content, "Копировать Peer ID", () -> copy(ownID));
-        name = input(content, "Имя профиля");
-        bootstrap = input(content, "Адрес узла /p2p/…");
-        bootstrap.setText(getPreferences(MODE_PRIVATE).getString("bootstrap", ""));
-        name.setText(getPreferences(MODE_PRIVATE).getString("name", ""));
-        button(content, "Подключить узел", () -> {
-            remember(); command("connect", "address", str(bootstrap));
-        });
-        button(content, "Резервировать relay", () -> {
-            remember(); command("reserve_relay", "address", str(bootstrap));
-        });
-        button(content, "Опубликовать профиль и маршруты", () -> {
-            remember(); command("put", "name", profileName()); command("publish_routes");
-        });
-        button(content, "Создать приглашение", () -> {
+        status = label("Запуск ядра…");content.addView(status);
+        networkStatus=label("Ожидание сети");content.addView(networkStatus);
+        name=input(content,"Ваше имя");
+        name.setText(getPreferences(MODE_PRIVATE).getString("name",""));
+        button(content,"Сохранить имя",()->{remember();configure();discover();});
+        autoNetwork=new Switch(this);autoNetwork.setText("Автоматическое подключение");autoNetwork.setChecked(getPreferences(MODE_PRIVATE).getBoolean("autoNetwork",true));content.addView(autoNetwork);
+        nearbyEnabled=new Switch(this);nearbyEnabled.setText("Устройства рядом");nearbyEnabled.setChecked(getPreferences(MODE_PRIVATE).getBoolean("nearbyEnabled",true));content.addView(nearbyEnabled);
+        autoNetwork.setOnCheckedChangeListener((v,checked)->{getPreferences(MODE_PRIVATE).edit().putBoolean("autoNetwork",checked).apply();configure();});
+        nearbyEnabled.setOnCheckedChangeListener((v,checked)->{getPreferences(MODE_PRIVATE).edit().putBoolean("nearbyEnabled",checked).apply();discover();});
+        restartButton=new Button(this);restartButton.setText("Запустить сеть");restartButton.setAllCaps(false);
+        restartButton.setOnClickListener(v->startCore());content.addView(restartButton);
+        nearbyPanel=column();content.addView(nearbyPanel);
+        button(content,"Дополнительные настройки",()->advancedPanel.setVisibility(advancedPanel.getVisibility()==View.VISIBLE?View.GONE:View.VISIBLE));
+        advancedPanel=column();advancedPanel.setVisibility(View.GONE);content.addView(advancedPanel);
+        diagnostic=label("");advancedPanel.addView(diagnostic);
+        identity=label("");identity.setTextIsSelectable(true);advancedPanel.addView(identity);
+        button(advancedPanel,"Копировать Peer ID",()->copy(ownID));
+        bootstrap=input(advancedPanel,"Добавить доверенный узел /p2p/…");
+        bootstrap.setText(getPreferences(MODE_PRIVATE).getString("bootstrap",""));
+        button(advancedPanel,"Сохранить дополнительный узел",()->{remember();configure();});
+        button(advancedPanel,"Сбросить дополнительный узел",()->{bootstrap.setText("");remember();configure();});
+        button(advancedPanel,"Обновить профиль и маршруты",()->{remember();configure();command("network_changed");});
+        button(advancedPanel, "Создать приглашение", () -> {
             remember();
             qrFile = new File(getCacheDir(), "betelgeuse-" + UUID.randomUUID() + ".svg");
             command("invite", "name", profileName(), "qr_path", qrFile.getAbsolutePath());
@@ -100,11 +127,11 @@ public final class RustActivity extends Activity {
             startActivity(Intent.createChooser(share, "Betelgeuse"));
         });
         button(inviteActions, "Показать QR-код", this::showQR);
-        inviteActions.setVisibility(View.GONE); content.addView(inviteActions);
-        inviteInput = input(content, "Вставьте приглашение");
-        button(content, "Добавить контакт", () -> command("import", "link", str(inviteInput)));
-        peerInput = input(content, "Поиск по Peer ID");
-        button(content, "Найти в DHT", () -> command("get", "peer", str(peerInput)));
+        inviteActions.setVisibility(View.GONE); advancedPanel.addView(inviteActions);
+        inviteInput = input(advancedPanel, "Вставьте приглашение");
+        button(advancedPanel, "Добавить контакт", () -> command("import", "link", str(inviteInput)));
+        peerInput = input(advancedPanel, "Поиск по Peer ID");
+        button(advancedPanel, "Найти в DHT", () -> command("get", "peer", str(peerInput)));
         content.addView(label("WebRTC"));
         iceUrls=input(content,"STUN/TURN URL (необязательно)");
         iceUrls.setText(getPreferences(MODE_PRIVATE).getString("iceUrls",""));
@@ -130,15 +157,81 @@ public final class RustActivity extends Activity {
         filePanel=column();content.addView(filePanel);
         call=new RustRtc(this,(peer,id,signal)->command("call_signal","peer",peer,"id",id,"signal",signal),this::renderCall);
         button(content, "Открыть совместимый режим 0.3", () -> startActivity(new Intent(this, MainActivity.class)));
-        try {
-            core = new RustCore(this);
-            handler.post(polling);
-        } catch (Throwable error) {
-            status.setText("Ядро недоступно: " + error.getMessage());
-        }
+        nearby=new NearbyDiscovery(this,this::renderNearby);
+        startCore();
+        connectivity=(ConnectivityManager)getSystemService(CONNECTIVITY_SERVICE);
+        networkCallback=new ConnectivityManager.NetworkCallback(){
+            @Override public void onAvailable(Network network){handler.post(()->{
+                boolean changed=lastNetwork!=null&&!lastNetwork.equals(network);lastNetwork=network;
+                if(ready){command("network_changed","reset",changed);if(changed&&nearby!=null)nearby.stop();discover();}
+            });}
+            @Override public void onLost(Network network){handler.post(()->{if(ready){command("network_changed");discover();}});}
+        };
+        try{connectivity.registerDefaultNetworkCallback(networkCallback);}catch(RuntimeException ignored){}
     }
 
-    private Object profileName() { String value = str(name); return value.isEmpty() ? JSONObject.NULL : value; }
+    private void startCore(){
+        if(ready)return;
+        handler.removeCallbacks(polling);
+        if(core!=null){core.close();core=null;}
+        status.setText("Запуск ядра…");restartButton.setEnabled(false);
+        try{core=new RustCore(this);handler.post(polling);
+            final RustCore started=core;
+            handler.postDelayed(()->{
+                if(ready||core!=started)return;
+                handler.removeCallbacks(polling);core.close();core=null;
+                status.setText("Ядро не ответило. Повторите запуск.");restartButton.setEnabled(true);
+            },15000);
+        }catch(Throwable error){status.setText("Ядро недоступно: "+error.getMessage());restartButton.setEnabled(true);}
+    }
+
+    private String cleanName(){
+        String value=str(name);
+        while(value.getBytes(StandardCharsets.UTF_8).length>120&&!value.isEmpty())value=value.substring(0,value.offsetByCodePoints(value.length(),-1));
+        return value;
+    }
+    private Object profileName() { String value=cleanName(); return value.isEmpty() ? JSONObject.NULL : value; }
+
+    private void configure(){
+        if(!ready)return;
+        try{
+            LinkedHashSet<String> nodes=new LinkedHashSet<>();
+            try(InputStream stream=getAssets().open("bootstrap-local.json")){
+                byte[] bytes=new byte[8192];int count=stream.read(bytes);
+                if(count>0){JSONArray values=new JSONObject(new String(bytes,0,count,StandardCharsets.UTF_8)).optJSONArray("nodes");
+                    if(values!=null)for(int i=0;i<values.length()&&nodes.size()<8;i++)nodes.add(values.getString(i));}
+            }catch(java.io.IOException ignored){}
+            String custom=str(bootstrap);if(!custom.isEmpty()&&nodes.size()<8)nodes.add(custom);
+            JSONObject settings=new JSONObject().put("enabled",autoNetwork.isChecked()).put("name",profileName()).put("addresses",new JSONArray(nodes));
+            command("configure_network","settings",settings);
+            if(nodes.isEmpty())networkStatus.setText("Нет настроенного интернет-узла");
+        }catch(Exception error){diagnostic.setText(error.getMessage());}
+    }
+
+    private void discover(){
+        if(nearby==null)return;
+        if(!foreground||!ready||!nearbyEnabled.isChecked()){nearby.stop();return;}
+        if(tcpPort>0)nearby.start(ownID,tcpPort,cleanName().isEmpty()?"Бетельгейзе":cleanName());
+    }
+    private void renderNearby(){
+        if(nearbyPanel==null)return;
+        nearbyPanel.removeAllViews();
+        nearbyPanel.addView(label("Рядом"));
+        if(nearbyEnabled.isChecked()){
+            nearbyPanel.addView(label(nearby==null?"Ожидание сети":nearby.status));
+            if(nearby!=null)for(NearbyDiscovery.Peer peer:nearby.peers()){
+                if(knownContacts.contains(peer.id))continue;
+                button(nearbyPanel,peer.name+" · Добавить",()->command("pair_request","address",peer.address,"name",profileName()));
+            }
+        }
+        for(JSONObject offer:pairOffers.values()){
+            String id=offer.optString("id"),peer=offer.optString("peer"),alias=offer.isNull("name")?"Бетельгейзе":offer.optString("name");
+            LinearLayout row=column();row.addView(label(alias+" предлагает контакт · "+peer.substring(Math.max(0,peer.length()-12))));
+            button(row,"Принять",()->command("pair_accept","id",id,"name",profileName()));
+            button(row,"Отклонить",()->command("pair_decline","id",id));nearbyPanel.addView(row);
+        }
+        if(!pairStatus.isEmpty())nearbyPanel.addView(label(pairStatus));
+    }
     private String str(EditText input) { return input.getText().toString().trim(); }
     private void remember() { getPreferences(MODE_PRIVATE).edit().putString("bootstrap", str(bootstrap)).putString("name", str(name)).apply(); }
 
@@ -158,7 +251,23 @@ public final class RustActivity extends Activity {
         switch (event.optString("event")) {
             case "started":
                 ownID = event.optString("peer"); identity.setText(ownID); status.setText("Узел запущен");
-                command("contacts"); command("files"); break;
+                ready=true;restartButton.setVisibility(View.GONE);
+                command("contacts");command("files");configure();discover();break;
+            case "listen":
+                int port=event.optInt("tcp_port",0);
+                if(port>0&&tcpPort!=port){tcpPort=port;discover();}break;
+            case "network_state":
+                switch(event.optString("state")){
+                    case "configured":networkStatus.setText(event.optInt("nodes")>0?"Автоматическое подключение…":"Локальный режим");break;
+                    case "connected":networkStatus.setText("Узел доступен. Устанавливаю маршрут…");break;
+                    case "ready":networkStatus.setText("Интернет P2P готов");break;
+                    case "retrying":networkStatus.setText("Переподключение…");break;
+                }break;
+            case "pair_offer":pairOffers.put(event.optString("id"),event);renderNearby();break;
+            case "pair_sent":pairStatus="Ожидаю подтверждения контакта…";renderNearby();break;
+            case "pair_result":case "pair_expired":
+                pairOffers.remove(event.optString("id"));
+                pairStatus=event.optBoolean("ok")?"Контакт добавлен":"Запрос закрыт или недоступен";renderNearby();break;
             case "connected":
                 status.setText("relay".equals(event.optString("route")) ? "Подключение через relay" : "Прямое подключение"); break;
             case "direct_upgrade":
@@ -167,8 +276,13 @@ public final class RustActivity extends Activity {
             case "relay_reserved":
                 status.setText("Ретранслятор доступен"); break;
             case "error": case "fatal": case "connection_error":
-                status.setText(event.optString("error", "Ошибка сети"));
-                if("fatal".equals(event.optString("event"))&&call!=null)call.hangup();
+                diagnostic.setText(event.optString("error","Ошибка сети"));
+                if("fatal".equals(event.optString("event"))){
+                    if(call!=null)call.hangup();ready=false;tcpPort=0;
+                    if(nearby!=null)nearby.stop();
+                    status.setText("Ошибка ядра: "+event.optString("error"));restartButton.setVisibility(View.VISIBLE);restartButton.setEnabled(true);
+                    if(core!=null){core.close();core=null;}
+                }else status.setText("Сетевая операция не завершена");
                 break;
             case "call_signal": case "call_delivery":
                 if(call!=null)call.receive(event,str(iceUrls),str(iceUser),str(icePassword));
@@ -181,16 +295,16 @@ public final class RustActivity extends Activity {
             case "contact":
                 inviteInput.setText(""); command("contacts"); break;
             case "contacts":
-                contacts.removeAllViews();
+                contacts.removeAllViews(); knownContacts.clear();
                 JSONArray list = event.optJSONArray("contacts");
                 if (list != null) for (int i = 0; i < list.length(); i++) {
                     JSONObject item = list.optJSONObject(i);
                     if (item == null) continue;
-                    String peer = item.optString("peer");
+                    String peer = item.optString("peer");knownContacts.add(peer);
                     String label = item.isNull("name") ? peer.substring(0, Math.min(12, peer.length())) : item.optString("name");
                     button(contacts, label, () -> { chosen = peer; chat.setVisibility(View.VISIBLE); messages.removeAllViews(); refresh(); });
                 }
-                break;
+                renderNearby();break;
             case "queued": case "message": case "delivery":
                 refresh(); break;
             case "history":
@@ -409,8 +523,12 @@ public final class RustActivity extends Activity {
         v.setTextColor(0xffc4c1ff); v.setOnClickListener(view -> action.run()); parent.addView(v);
     }
 
+    @Override protected void onResume(){super.onResume();foreground=true;discover();if(ready)command("network_changed");}
+    @Override protected void onPause(){foreground=false;if(nearby!=null)nearby.stop();super.onPause();}
     @Override protected void onDestroy() {
         handler.removeCallbacks(polling);
+        if(nearby!=null)nearby.stop();
+        if(connectivity!=null&&networkCallback!=null)try{connectivity.unregisterNetworkCallback(networkCallback);}catch(RuntimeException ignored){}
         if(call!=null)call.hangup();
         if (core != null) { core.close(); core = null; }
         if (qrFile != null) qrFile.delete();

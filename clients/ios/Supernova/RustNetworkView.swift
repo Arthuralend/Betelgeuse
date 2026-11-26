@@ -3,6 +3,7 @@ import Security
 import CoreImage.CIFilterBuiltins
 import BetelgeuseCore
 import UniformTypeIdentifiers
+import Network
 
 struct RustContact: Identifiable {
     var id: String
@@ -14,6 +15,12 @@ struct RustMessage: Identifiable {
     var text: String
     var mine: Bool
     var delivered: Bool
+}
+
+struct RustPairOffer: Identifiable {
+    let id:String
+    let peer:String
+    let name:String
 }
 
 struct RustTransfer: Identifiable {
@@ -35,6 +42,14 @@ final class RustNetwork: ObservableObject {
     @Published var invitation = ""
     @Published var lastRecord = ""
     @Published var ready = false
+    @Published var starting = false
+    @Published var tcpPort = 0
+    @Published var networkStatus = "Ожидание сети"
+    @Published var pairStatus = ""
+    @Published var pairOffers:[RustPairOffer] = []
+    private var appleInviteCallbacks:[String:(String?)->Void]=[:]
+    private var previewCallbacks:[String:(String?,String?)->Void]=[:]
+    private var startupTimeout:DispatchWorkItem?
     @Published var transfers: [RustTransfer] = []
     var onCallEvent: (([String:Any]) -> Void)?
     var onStop: (() -> Void)?
@@ -57,9 +72,10 @@ final class RustNetwork: ObservableObject {
     }
 
     func start() {
-        guard !ready else { return }
+        guard !ready,!starting else { return }
         if engine != nil { stop() }
         status = "Запуск ядра…"
+        starting = true
         do {
             let secret = try Self.loadIdentity()
             let directory = URL.applicationSupportDirectory.appendingPathComponent("BetelgeuseRust", isDirectory: true)
@@ -71,11 +87,21 @@ final class RustNetwork: ObservableObject {
             }
             engine = instance
             timer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] _ in self?.poll() }
-        } catch { status = error.localizedDescription }
+            // Continue polling while the keyboard, lists and scrolling change run-loop modes.
+            if let timer { RunLoop.main.add(timer,forMode:.common) }
+            let timeout=DispatchWorkItem{[weak self] in
+                guard let self,!self.ready,self.starting else{return}
+                self.stop()
+                self.status="Ядро не ответило. Нажмите «Запустить сеть»."
+            }
+            startupTimeout=timeout
+            DispatchQueue.main.asyncAfter(deadline:.now()+15,execute:timeout)
+        } catch { starting=false; status = error.localizedDescription }
     }
 
     func stop() {
         onStop?()
+        startupTimeout?.cancel();startupTimeout=nil;starting=false
         timer?.invalidate()
         timer = nil
         if let engine { bgl_close(engine) }
@@ -85,7 +111,9 @@ final class RustNetwork: ObservableObject {
         for folder in staged.values { try? FileManager.default.removeItem(at:folder) }
         staged.removeAll()
         transfers.removeAll()
-        ready = false
+        ready = false;tcpPort=0;pairOffers.removeAll()
+        appleInviteCallbacks.removeAll();previewCallbacks.removeAll()
+        networkStatus="Сеть остановлена"
         status = "Сеть остановлена"
     }
 
@@ -115,6 +143,52 @@ final class RustNetwork: ObservableObject {
               let json = String(data: bytes, encoding: .utf8) else { return false }
         if bgl_send(engine, json) != 0 { status = Self.take(bgl_last_error()) ?? "Команда недоступна"; return false }
         return true
+    }
+
+    static func cleanName(_ name:String)->String {
+        var value=String(name.trimmingCharacters(in:.whitespacesAndNewlines).prefix(40))
+        while value.utf8.count>120 {value.removeLast()}
+        return value
+    }
+    static var bundledNodes:[String] {
+        guard let url=Bundle.main.url(forResource:"bootstrap-local",withExtension:"json"),
+              let data=try? Data(contentsOf:url), data.count<8192,
+              let value=try? JSONSerialization.jsonObject(with:data) as? [String:Any],
+              let nodes=value["nodes"] as? [String] else{return []}
+        return Array(nodes.prefix(8))
+    }
+
+    func configure(name:String,enabled:Bool,custom:[String]) {
+        let clean=Self.cleanName(name)
+        let nodes=Array(NSOrderedSet(array:Self.bundledNodes+custom).array.compactMap{$0 as? String}.prefix(8))
+        send(["op":"configure_network","settings":["enabled":enabled,"name":clean.isEmpty ? NSNull() : clean as Any,"addresses":nodes]])
+        if nodes.isEmpty { networkStatus="Нет настроенного интернет-узла" }
+    }
+
+    func pair(address:String,name:String) { 
+        let value=Self.cleanName(name)
+        send(["op":"pair_request","address":address,"name":value.isEmpty ? NSNull() : value as Any])
+    }
+    func acceptPair(_ offer:RustPairOffer,name:String) {
+        let value=Self.cleanName(name)
+        send(["op":"pair_accept","id":offer.id,"name":value.isEmpty ? NSNull() : value as Any])
+    }
+    func declinePair(_ offer:RustPairOffer) {
+        send(["op":"pair_decline","id":offer.id])
+    }
+    func appleInvite(name:String,completion:@escaping(String?)->Void) {
+        guard appleInviteCallbacks.count<8 else{completion(nil);return}
+        let token=UUID().uuidString
+        appleInviteCallbacks[token]=completion
+        let value=Self.cleanName(name)
+        if !send(["op":"apple_invitation","token":token,"name":value.isEmpty ? NSNull() : value as Any]) {
+            appleInviteCallbacks.removeValue(forKey:token)?(nil)
+        }
+    }
+    func previewApple(_ link:String,completion:@escaping(String?,String?)->Void) {
+        guard previewCallbacks.count<8 else{completion(nil,nil);return}
+        let token=UUID().uuidString;previewCallbacks[token]=completion
+        if !send(["op":"preview_invitation","link":link,"token":token]) {previewCallbacks.removeValue(forKey:token)?(nil,nil)}
     }
 
     func sendFile(_ url: URL, peer: String) {
@@ -213,10 +287,12 @@ final class RustNetwork: ObservableObject {
             case "started":
                 ownID = event["peer"] as? String ?? ""
                 status = "Узел запущен"
+                startupTimeout?.cancel();startupTimeout=nil;starting=false
                 ready = true
                 send(["op": "contacts"])
                 send(["op": "files"])
             case "listen":
+                if let port=event["tcp_port"] as? Int,port>0 {tcpPort=port}
                 if let address = event["address"] as? String, address.contains("/p2p-circuit/") { status = "Маршрут через relay готов" }
             case "connected":
                 status = event["route"] as? String == "relay" ? "Подключение через relay" : "Прямое подключение"
@@ -224,6 +300,27 @@ final class RustNetwork: ObservableObject {
                 if event["ok"] as? Bool == true { status = "Прямое P2P-соединение" }
             case "relay_reserved":
                 status = "Ретранслятор доступен"
+            case "network_state":
+                switch event["state"] as? String {
+                case "configured": networkStatus=(event["nodes"] as? Int ?? 0)>0 ? "Автоматическое подключение…" : "Локальный режим"
+                case "connected": networkStatus="Узел доступен. Устанавливаю маршрут…"
+                case "ready":networkStatus="Интернет P2P готов"
+                case "retrying":networkStatus="Переподключение…"
+                default:break
+                }
+            case "pair_offer":
+                if let id=event["id"] as? String,let peer=event["peer"] as? String {
+                    pairOffers.removeAll{$0.id==id}
+                    pairOffers.append(RustPairOffer(id:id,peer:peer,name:event["name"] as? String ?? "Бетельгейзе"))
+                }
+            case "pair_sent":pairStatus="Ожидаю подтверждения контакта…"
+            case "pair_result","pair_expired":
+                if let id=event["id"] as? String {pairOffers.removeAll{$0.id==id}}
+                pairStatus=(event["event"] as? String=="pair_expired") ? "Запрос закрыт" : (event["ok"] as? Bool==true ? "Контакт добавлен" : "Запрос не принят или недоступен")
+            case "apple_invite":
+                if let token=event["token"] as? String {appleInviteCallbacks.removeValue(forKey:token)?(event["ok"] as? Bool==true ? event["link"] as? String:nil)}
+            case "invite_preview":
+                if let token=event["token"] as? String {previewCallbacks.removeValue(forKey:token)?(event["peer"] as? String,event["name"] as? String)}
             case "connection_error", "error", "fatal":
                 status = event["error"] as? String ?? "Ошибка сети"
                 if event["event"] as? String == "fatal" {
@@ -271,37 +368,126 @@ final class RustNetwork: ObservableObject {
 struct RustNetworkView: View {
     @StateObject private var core = RustNetwork()
     @StateObject private var call = RustCall()
+    @StateObject private var nearby=NearbyDiscovery()
+    @StateObject private var applePair=ApplePair()
+    @Environment(\.scenePhase) private var scenePhase
+    @AppStorage("rust.autoNetwork") private var autoNetwork=true
+    @AppStorage("rust.nearbyEnabled") private var nearbyEnabled=true
+    @AppStorage("rust.bootstrap") private var customNode=""
+    @State private var advanced=false
+    @State private var networkMonitor:NWPathMonitor?
+    @State private var visible=false
     @AppStorage("rust.ice") private var ice = ""
     @State private var turnUser=""
     @State private var turnPassword=""
     @State private var pickingFile=false
     private var settings:CallIceSettings { CallIceSettings(urls:ice,username:turnUser,password:turnPassword) }
     @AppStorage("rust.displayname") private var name = ""
-    @AppStorage("rust.bootstrap") private var bootstrap = ""
+    @State private var bootstrap = ""
     @State private var input = ""
     @State private var peer = ""
     @State private var text = ""
 
+    private func configure() {
+        guard core.ready else{return}
+        let custom=customNode.isEmpty ? [] : [customNode]
+        core.configure(name:name,enabled:autoNetwork,custom:custom)
+        let display=RustNetwork.cleanName(name)
+        applePair.createInvite={ [weak core] done in
+            guard let core else{done(nil);return}
+            core.appleInvite(name:display,completion:done)
+        }
+    }
+    private func discover() {
+        guard visible,scenePhase == .active,nearbyEnabled,core.ready else{nearby.stop();applePair.stop();return}
+        let alias=RustNetwork.cleanName(name)
+        let display=alias.isEmpty ? "Бетельгейзе":String(alias.prefix(40))
+        if core.tcpPort>0 {nearby.start(peer:core.ownID,port:core.tcpPort,name:display)}
+        applePair.start(peer:core.ownID,name:display)
+    }
+    private func monitor() {
+        guard networkMonitor==nil else{return}
+        let value=NWPathMonitor()
+        var prior:String?
+        value.pathUpdateHandler={ [weak core] path in
+            let key="\(path.status)-\(path.usesInterfaceType(.wifi))-\(path.usesInterfaceType(.cellular))-\(path.usesInterfaceType(.wiredEthernet))"
+            let changed=prior != nil && prior != key && path.status == .satisfied
+            prior=key
+            DispatchQueue.main.async {
+                guard let core,core.ready else{return}
+                core.send(["op":"network_changed","reset":changed])
+            }
+        }
+        networkMonitor=value;value.start(queue:DispatchQueue(label:"betelgeuse.network.status"))
+    }
     var body: some View {
         NavigationStack {
             List {
-                Section {
-                    Text(core.status).foregroundStyle(.secondary)
-                    if !core.ownID.isEmpty {
-                        Text(core.ownID).font(.caption.monospaced()).textSelection(.enabled)
-                        Button("Копировать Peer ID") { UIPasteboard.general.string = core.ownID }
+                Section("Сеть") {
+                    Label(core.ready ? core.networkStatus : core.status,systemImage:core.ready ? "network" : "exclamationmark.circle")
+                        .foregroundStyle(core.ready ? Color.green : Color.secondary)
+                    if core.starting { ProgressView("Запуск сети…") }
+                    TextField("Ваше имя",text:$name)
+                        .onSubmit{configure();discover()}
+                    Button("Сохранить имя"){configure();discover()}
+                    Toggle("Автоматическое подключение",isOn:$autoNetwork)
+                    Toggle("Устройства рядом",isOn:$nearbyEnabled)
+                    DisclosureGroup("Дополнительные настройки",isExpanded:$advanced) {
+                        Text(core.status).font(.caption).foregroundStyle(.secondary)
+                        if !core.ownID.isEmpty {
+                            Text(core.ownID).font(.caption.monospaced()).textSelection(.enabled)
+                            Button("Копировать Peer ID"){UIPasteboard.general.string=core.ownID}
+                        }
+                        TextField("Добавить доверенный узел /p2p/…",text:$bootstrap).textInputAutocapitalization(.never).autocorrectionDisabled()
+                        Button("Сохранить дополнительный узел"){customNode=bootstrap.trimmingCharacters(in:.whitespacesAndNewlines);configure()}
+                        Button("Сбросить дополнительный узел"){customNode="";bootstrap="";configure()}
+                        Button("Обновить профиль и маршруты"){configure();core.send(["op":"network_changed"])}
                     }
-                    TextField("Имя профиля", text: $name)
-                    TextField("Адрес узла /p2p/…", text: $bootstrap).textInputAutocapitalization(.never).autocorrectionDisabled()
-                    HStack {
-                        Button("Подключить узел") { core.send(["op":"connect","address":bootstrap]) }
-                        Spacer()
-                        Button("Резервировать relay") { core.send(["op":"reserve_relay","address":bootstrap]) }
-                    }.buttonStyle(.borderless)
-                    Button("Опубликовать профиль и маршруты") {
-                        core.send(["op":"put","name":name.isEmpty ? NSNull() : name as Any])
-                        core.send(["op":"publish_routes"])
+                }
+                Section("Рядом") {
+                    if !nearbyEnabled {Text("Поиск отключён").foregroundStyle(.secondary)}
+                    else {
+                        Text(nearby.status).font(.caption).foregroundStyle(.secondary)
+                        if nearby.peers.isEmpty && applePair.peers.isEmpty {Text("Откройте Бетельгейзе на другом устройстве").foregroundStyle(.secondary)}
+                        ForEach(nearby.peers.filter{p in !core.contacts.contains{$0.id==p.id}}){item in
+                            HStack {
+                                VStack(alignment:.leading){Text(item.name);Text("Wi-Fi · "+String(item.id.suffix(8))).font(.caption).foregroundStyle(.secondary)}
+                                Spacer()
+                                Button("Добавить"){core.pair(address:item.address,name:name)}.buttonStyle(.bordered)
+                            }
+                        }
+                        ForEach(applePair.peers.filter{p in !nearby.peers.contains{$0.id==p.id} && !core.contacts.contains{$0.id==p.id}}){item in
+                            HStack {
+                                VStack(alignment:.leading){Text(item.name);Text("Apple рядом · "+String(item.id.suffix(8))).font(.caption).foregroundStyle(.secondary)}
+                                Spacer()
+                                Button("Добавить"){applePair.request(item)}.buttonStyle(.bordered)
+                            }
+                        }
                     }
+                    ForEach(core.pairOffers){offer in
+                        VStack(alignment:.leading){
+                            Text("\(offer.name) предлагает добавить контакт")
+                            Text("Проверенный Peer ID: "+String(offer.peer.suffix(12))).font(.caption)
+                            HStack {
+                                Button("Принять"){core.acceptPair(offer,name:name)}.buttonStyle(.borderedProminent)
+                                Button("Отклонить",role:.destructive){core.declinePair(offer)}.buttonStyle(.bordered)
+                            }
+                        }
+                    }
+                    if let offer=applePair.offer {
+                        VStack(alignment:.leading){
+                            Text("\(offer.name) предлагает добавить контакт")
+                            Text("Проверенный Peer ID: "+String(offer.peer.suffix(12))).font(.caption)
+                            HStack {
+                                Button("Принять"){applePair.accept()}.buttonStyle(.borderedProminent)
+                                Button("Отклонить",role:.destructive){applePair.decline()}.buttonStyle(.bordered)
+                            }
+                        }
+                    }
+                    if !core.pairStatus.isEmpty {Text(core.pairStatus).font(.caption).foregroundStyle(.secondary)}
+                    if !applePair.status.isEmpty {Text(applePair.status).font(.caption).foregroundStyle(.secondary)}
+                }.disabled(!core.ready)
+                Section("Приглашения вручную (необязательно)") {
                     Button("Создать приглашение") {
                         core.send(["op":"invite","name":name.isEmpty ? NSNull() : name as Any])
                     }
@@ -401,19 +587,35 @@ struct RustNetworkView: View {
                         }
                     }
                 }
-                Section { if core.ready { Button("Остановить сеть", action:core.stop) } else { Button("Запустить сеть", action:core.start) } }
+                Section { if core.ready { Button("Остановить сеть", action:core.stop) } else { Button("Запустить сеть", action:core.start).disabled(core.starting) } }
             }
             .navigationTitle("Бетельгейзе")
             .fileImporter(isPresented:$pickingFile,allowedContentTypes:[.item]) { result in
                 if case .success(let url)=result { core.sendFile(url,peer:core.selected) }
             }
             .onAppear {
+                visible=true
+                bootstrap=customNode
+                applePair.preview={ [weak core] link,done in
+                    guard let core else {done(nil,nil);return}
+                    core.previewApple(link,completion:done)
+                }
+                applePair.importInvite={ [weak core] link,peer in _ = core?.send(["op":"import_verified","link":link,"expected_peer":peer]) }
                 call.sender = { [weak core] in core?.send($0) ?? false }
                 core.onCallEvent = { [weak call] event in call?.receive(event,settings:settings) }
-                core.onStop = { [weak call] in call?.hangup() }
-                core.start()
+                core.onStop = { [weak call,weak nearby,weak applePair] in call?.hangup();nearby?.stop();applePair?.stop() }
+                core.start();monitor()
+                if core.ready {configure();discover()}
             }
-            .onDisappear { call.hangup() }
+            .onDisappear {visible=false;call.hangup();nearby.stop();applePair.stop();networkMonitor?.cancel();networkMonitor=nil}
+            .onChange(of:core.ready){if $0{configure();discover()}}
+            .onChange(of:core.tcpPort){_ in discover()}
+            .onChange(of:autoNetwork){_ in configure()}
+            .onChange(of:nearbyEnabled){_ in discover()}
+            .onChange(of:scenePhase){phase in
+                if phase == .active {if !core.ready{core.start()};core.send(["op":"network_changed"]);discover()}
+                else if phase == .background {nearby.stop();applePair.stop()}
+            }
             .onChange(of:ice) { _ in core.onCallEvent = { [weak call] event in call?.receive(event,settings:settings) } }
             .onChange(of:turnUser) { _ in core.onCallEvent = { [weak call] event in call?.receive(event,settings:settings) } }
             .onChange(of:turnPassword) { _ in core.onCallEvent = { [weak call] event in call?.receive(event,settings:settings) } }

@@ -1,5 +1,6 @@
 use crate::{
     invitations::Invitation,
+    nearby::{PairRequest, PairReply},
     exchange::{Request as Exchange, Reply as ExchangeReply, Signal, Transfers},
     records::{now_ms, Kind, Payload, SignedRecord, MAX_RECORD},
     storage::{Message, Store},
@@ -9,8 +10,8 @@ use futures::StreamExt;
 use libp2p::{
     identify, identity, autonat, relay, dcutr,
     kad::{self, store::{MemoryStore, MemoryStoreConfig, RecordStore}},
-    multiaddr::Protocol, noise, ping, request_response, swarm::{NetworkBehaviour, SwarmEvent, behaviour::toggle::Toggle},
-    tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
+    multiaddr::Protocol, noise, ping, request_response, swarm::{NetworkBehaviour, SwarmEvent, behaviour::toggle::Toggle, dial_opts::{DialOpts, PeerCondition}, DialError},
+    core::transport::ListenerId, tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -22,6 +23,36 @@ use tokio::sync::mpsc;
 const DHT_PROTOCOL: &str = "/betelgeuse/kad/1.0.0";
 const MESSAGE_PROTOCOL: &str = "/betelgeuse/message/1.0.0";
 const EXCHANGE_PROTOCOL: &str = "/betelgeuse/exchange/1.0.0";
+const PAIR_PROTOCOL: &str = "/betelgeuse/pair/1.0.0";
+const HOP_PROTOCOL: &str = "/libp2p/circuit/relay/0.2.0/hop";
+const MAX_PAIR: usize = 12;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoSettings {
+    pub enabled: bool,
+    pub name: Option<String>,
+    pub addresses: Vec<String>,
+}
+
+struct Seed {
+    address: Multiaddr,
+    listener: Option<ListenerId>,
+    supported_relay: bool,
+    reserved: bool,
+    next_attempt: Instant,
+    reservation_deadline: Option<Instant>,
+    backoff: u64,
+}
+struct PairIncoming {
+    peer: PeerId,
+    request: PairRequest,
+    channel: request_response::ResponseChannel<PairReply>,
+    expires: Instant,
+}
+struct PairWaiting { peer: PeerId, request: PairRequest, expires: Instant }
+struct PairOutbound { peer: PeerId, id: String }
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -33,6 +64,7 @@ struct Behaviour {
     identify: identify::Behaviour,
     messages: request_response::cbor::Behaviour<Message, Ack>,
     exchange: request_response::cbor::Behaviour<Exchange, ExchangeReply>,
+    pairing: request_response::cbor::Behaviour<PairRequest, PairReply>,
     ping: ping::Behaviour,
     relay_client: relay::client::Behaviour,
     relay_server: Toggle<relay::Behaviour>,
@@ -45,6 +77,14 @@ struct Behaviour {
 pub enum Command {
     Connect { address: String },
     Bootstrap,
+    ConfigureNetwork { settings: AutoSettings },
+    NetworkChanged { reset: Option<bool> },
+    PairRequest { address: String, name: Option<String> },
+    PairAccept { id: String, name: Option<String> },
+    PairDecline { id: String },
+    PreviewInvitation { link: String, token: String },
+    AppleInvitation { name: Option<String>, token: String },
+    ImportVerified { link: String, expected_peer: String },
     ReserveRelay { address: String },
     Announce { address: String },
     Put { name: Option<String> },
@@ -93,6 +133,14 @@ struct Node {
     events: mpsc::Sender<Value>,
     routed: HashSet<PeerId>,
     server: bool,
+    auto_config: Option<AutoSettings>,
+    seeds: HashMap<PeerId, Seed>,
+    publish_due: Instant,
+    refresh_due: Instant,
+    refresh_index: usize,
+    pair_incoming: HashMap<String, PairIncoming>,
+    pair_waiting: HashMap<PeerId, PairWaiting>,
+    pair_outbound: HashMap<request_response::OutboundRequestId, PairOutbound>,
 }
 
 impl Node {
@@ -141,6 +189,12 @@ impl Node {
                 [(StreamProtocol::new(EXCHANGE_PROTOCOL), request_response::ProtocolSupport::Full)],
                 request_response::Config::default().with_request_timeout(Duration::from_secs(30))
                     .with_max_concurrent_streams(32)),
+            pairing: request_response::cbor::Behaviour::with_codec(
+                request_response::cbor::codec::Codec::default()
+                    .set_request_size_maximum(32_768).set_response_size_maximum(32_768),
+                [(StreamProtocol::new(PAIR_PROTOCOL), request_response::ProtocolSupport::Full)],
+                request_response::Config::default().with_request_timeout(Duration::from_secs(90))
+                    .with_max_concurrent_streams(24)),
             ping: ping::Behaviour::default(),
             relay_client,
             relay_server: Toggle::from(relay_server.then(|| relay::Behaviour::new(peer, relay::Config {
@@ -153,7 +207,9 @@ impl Node {
             .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(120)))
             .build();
         Ok(Self { swarm, store, key, peer, lookups: HashMap::new(), publications: HashMap::new(),
-            outbound: HashMap::new(), exchanges: HashMap::new(), transfers, events, routed: HashSet::new(), server })
+            outbound: HashMap::new(), exchanges: HashMap::new(), transfers, events, routed: HashSet::new(), server,
+            auto_config:None, seeds:HashMap::new(), publish_due:Instant::now(), refresh_due:Instant::now(), refresh_index:0,
+            pair_incoming:HashMap::new(),pair_waiting:HashMap::new(),pair_outbound:HashMap::new() })
     }
 
     async fn emit(&self, value: Value) -> Result<()> {
@@ -167,14 +223,215 @@ impl Node {
             anyhow::bail!("include /p2p/<PeerId> in the address");
         };
         ensure!(peer != self.peer, "cannot connect to own node");
-        self.swarm.dial(address)?;
-        Ok(())
+        self.dial_fresh(peer, vec![address])
+    }
+
+    /// Allocate a fresh local port rather than binding to the listening socket.
+    /// In particular Apple network stacks may reject the reused bind.
+    fn dial_fresh(&mut self, peer: PeerId, addresses: Vec<Multiaddr>) -> Result<()> {
+        if self.swarm.is_connected(&peer) { return Ok(()); }
+        let options = DialOpts::peer_id(peer)
+            .condition(PeerCondition::DisconnectedAndNotDialing)
+            .addresses(addresses)
+            .allocate_new_port()
+            .build();
+        match self.swarm.dial(options) {
+            Ok(()) | Err(DialError::DialPeerConditionFalse(_)) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn reserve_relay(&mut self, address: Multiaddr) -> Result<()> {
         ensure!(matches!(address.iter().last(), Some(Protocol::P2p(_))) &&
             !address.iter().any(|part| part == Protocol::P2pCircuit), "relay address must end in /p2p/<relay PeerId>");
+        if let Some(Protocol::P2p(peer))=address.iter().last() {
+            if self.seeds.get(&peer).and_then(|s|s.listener).is_some() { return Ok(()); }
+        }
         self.swarm.listen_on(address.with(Protocol::P2pCircuit))?;
+        Ok(())
+    }
+
+    fn configure(&mut self, config: AutoSettings, persist: bool) -> Result<()> {
+        ensure!(config.addresses.len()<=8, "at most eight trusted nodes");
+        if let Some(name)=config.name.as_ref() {
+            ensure!(!name.trim().is_empty()&&name.len()<=120&&!name.chars().any(char::is_control),"invalid display name");
+        }
+        let mut wanted=HashMap::new();
+        for value in &config.addresses {
+            let address:Multiaddr=value.parse()?;
+            let parts:Vec<_>=address.iter().collect();
+            let peer=match parts.as_slice() {
+                [Protocol::Ip4(ip),Protocol::Tcp(port),Protocol::P2p(peer)] if !ip.is_unspecified()&&!ip.is_multicast()&&*port!=0=>*peer,
+                [Protocol::Ip6(ip),Protocol::Tcp(port),Protocol::P2p(peer)] if !ip.is_unspecified()&&!ip.is_multicast()&&*port!=0=>*peer,
+                _=>anyhow::bail!("trusted node must use a numeric IP, TCP port and Peer ID"),
+            };
+            ensure!(peer!=self.peer,"cannot use own identity as a trusted node");
+            wanted.insert(peer,address);
+        }
+        if persist { self.store.set_network_settings(&serde_json::to_string(&config)?)?; }
+        let old:Vec<_>=self.seeds.keys().copied().collect();
+        for peer in old {
+            let keep=config.enabled&&wanted.get(&peer).map_or(false,|a|self.seeds.get(&peer).map_or(false,|s|s.address==*a));
+            if !keep {
+                if let Some(seed)=self.seeds.remove(&peer) {
+                    if let Some(id)=seed.listener { self.swarm.remove_listener(id); }
+                }
+            }
+        }
+        if config.enabled {
+            for (peer,address) in wanted {
+                self.seeds.entry(peer).or_insert_with(||Seed {address,listener:None,supported_relay:false,reserved:false,
+                    next_attempt:Instant::now(),reservation_deadline:None,backoff:2});
+            }
+        }
+        self.auto_config=Some(config);
+        self.publish_due=Instant::now();
+        self.refresh_due=Instant::now();
+        Ok(())
+    }
+
+    fn clear_seed_listener(&mut self, peer: PeerId) {
+        if let Some(seed)=self.seeds.get_mut(&peer) {
+            if let Some(id)=seed.listener.take() { self.swarm.remove_listener(id); }
+            seed.reserved=false;
+            seed.reservation_deadline=None;
+            seed.next_attempt=Instant::now()+Duration::from_secs(seed.backoff);
+        }
+    }
+
+    async fn auto_tick(&mut self) -> Result<()> {
+        let now=Instant::now();
+        let expired:Vec<_>=self.pair_incoming.iter().filter_map(|(id,v)|(now>=v.expires).then(||id.clone())).collect();
+        for id in expired {
+            if let Some(v)=self.pair_incoming.remove(&id) {
+                let _=self.swarm.behaviour_mut().pairing.send_response(v.channel,PairReply{id:v.request.id,link:None});
+                self.emit(json!({"event":"pair_expired","id":id})).await?;
+            }
+        }
+        let expired:Vec<_>=self.pair_waiting.iter().filter_map(|(p,v)|(now>=v.expires).then_some(*p)).collect();
+        for p in expired {
+            if let Some(v)=self.pair_waiting.remove(&p) {
+                self.emit(json!({"event":"pair_result","peer":p.to_string(),"id":v.request.id,"ok":false,"error":"connection timeout"})).await?;
+            }
+        }
+        let targets:Vec<_>=self.seeds.keys().copied().collect();
+        for peer in targets {
+            let connected=self.swarm.is_connected(&peer);
+            if self.seeds[&peer].reservation_deadline.map_or(false, |d|now>=d) {
+                self.clear_seed_listener(peer);
+            }
+            let seed=&self.seeds[&peer];
+            if now<seed.next_attempt {continue;}
+            if !connected {
+                let address=seed.address.clone();
+                let result=self.dial_fresh(peer,vec![address]);
+                let seed=self.seeds.get_mut(&peer).unwrap();
+                seed.next_attempt=now+Duration::from_secs(seed.backoff);
+                seed.backoff=(seed.backoff*2).min(60);
+                if let Err(error)=result {
+                    self.emit(json!({"event":"network_state","state":"retrying","error":error.to_string()})).await?;
+                }
+            } else if seed.supported_relay&&seed.listener.is_none() {
+                let route=seed.address.clone().with(Protocol::P2pCircuit);
+                let result=self.swarm.listen_on(route);
+                let seed=self.seeds.get_mut(&peer).unwrap();
+                seed.next_attempt=now+Duration::from_secs(seed.backoff);
+                match result {
+                    Ok(id)=>{seed.listener=Some(id);seed.reservation_deadline=Some(now+Duration::from_secs(25));}
+                    Err(_)=>{seed.backoff=(seed.backoff*2).min(60);}
+                }
+            }
+        }
+        let Some(settings)=self.auto_config.clone().filter(|s|s.enabled) else {return Ok(());};
+        let ready_count=self.seeds.values().filter(|s|s.reserved).count();
+        if ready_count>0&&now>=self.publish_due {
+            // Route announcements include only public relay routes, not the local LAN address.
+            let routes:Vec<_>=self.addresses(None)?.into_iter().filter(|a|a.iter().any(|p|p==Protocol::P2pCircuit)).collect();
+            if !routes.is_empty() {
+                let profile=self.profile(settings.name)?;
+                let routing=self.routes(Some(routes.iter().map(ToString::to_string).collect()))?;
+                if self.publications.len()<14 {
+                    self.publish(profile)?;
+                    self.publish(routing)?;
+                    self.publish_due=now+Duration::from_secs(5*60);
+                }
+            }
+        }
+        if ready_count>0&&now>=self.refresh_due {
+            let contacts=self.store.contacts()?;
+            let count=contacts.len();
+            if count>0 {
+                // Bounded round-robin to avoid monopolizing the network actor.
+                for step in 0..count.min(8) {
+                    let item=&contacts[(self.refresh_index+step)%count];
+                    if let Ok(peer)=item.peer.parse::<PeerId>() {
+                        if self.lookups.len()<24 { let _=self.lookup(peer,Kind::Routes); }
+                        if self.store.pending(&peer).map_or(false,|m|!m.is_empty()) { let _=self.retry(peer); }
+                    }
+                }
+                self.refresh_index=(self.refresh_index+count.min(8))%count;
+            }
+            self.refresh_due=now+Duration::from_secs(60);
+        }
+        Ok(())
+    }
+
+    fn invitation(&mut self,name:Option<String>) -> Result<Invitation> {
+        Ok(Invitation{account:self.profile(name)?,routes:self.routes(None)?})
+    }
+
+    fn send_pair(&mut self, sender:PairWaiting) {
+        let id=sender.request.id.clone();
+        let request_id=self.swarm.behaviour_mut().pairing.send_request(&sender.peer,sender.request);
+        self.pair_outbound.insert(request_id,PairOutbound{peer:sender.peer,id});
+    }
+
+    async fn add_invitation(&mut self, invite:&Invitation) -> Result<()> {
+        let contact=invite.import(&mut self.store,&self.peer)?;
+        self.add_contact_addresses(&contact.routes)?;
+        self.emit(json!({"event":"contact","contact":contact})).await?;
+        Ok(())
+    }
+
+    async fn on_pair(&mut self,event:request_response::Event<PairRequest,PairReply>) -> Result<()> {
+        match event {
+            request_response::Event::Message{peer,message,..}=>match message {
+                request_response::Message::Request{request,channel,..}=>{
+                    let valid=uuid::Uuid::parse_str(&request.id).map_or(false,|v|v.to_string()==request.id);
+                    let invite=Invitation::decode(&request.link).and_then(|i|{ensure!(i.verify()?==peer,"pair peer mismatch"); Ok(i)});
+                    if !valid||self.pair_incoming.len()>=MAX_PAIR||self.pair_incoming.contains_key(&request.id)||
+                        self.pair_incoming.values().any(|x|x.peer==peer)||invite.is_err() {
+                        let _=self.swarm.behaviour_mut().pairing.send_response(channel,PairReply{id:request.id,link:None});
+                        return Ok(());
+                    }
+                    let invite=invite?;
+                    let name=match &invite.account.body.payload {Payload::Account{name}=>name.clone(),_=>None};
+                    let id=request.id.clone();
+                    self.pair_incoming.insert(id.clone(),PairIncoming{peer,request,channel,expires:Instant::now()+Duration::from_secs(75)});
+                    self.emit(json!({"event":"pair_offer","id":id,"peer":peer.to_string(),"name":name})).await?;
+                }
+                request_response::Message::Response{request_id,response}=>{
+                    if let Some(out)=self.pair_outbound.remove(&request_id) {
+                        let result:Result<()> = async {
+                            ensure!(peer==out.peer&&response.id==out.id,"pair response mismatch");
+                            let link=response.link.context("pair request declined")?;
+                            let invite=Invitation::decode(&link)?;
+                            ensure!(invite.verify()?==peer,"pair peer mismatch");
+                            self.add_invitation(&invite).await?;
+                            Ok(())
+                        }.await;
+                        self.emit(json!({"event":"pair_result","id":out.id,"peer":peer.to_string(),"ok":result.is_ok(),
+                             "error":result.err().map(|e|e.to_string())})).await?;
+                    }
+                }
+            },
+            request_response::Event::OutboundFailure{peer,request_id,error,..}=>{
+                if let Some(out)=self.pair_outbound.remove(&request_id) {
+                    self.emit(json!({"event":"pair_result","peer":peer.to_string(),"id":out.id,"ok":false,"error":error.to_string()})).await?;
+                }
+            }
+            _=>{}
+        }
         Ok(())
     }
 
@@ -222,6 +479,7 @@ impl Node {
     }
 
     fn lookup(&mut self, peer: PeerId, kind: Kind) -> Result<()> {
+        if self.lookups.values().any(|q|q.peer==peer&&q.kind==kind) { return Ok(()); }
         ensure!(self.lookups.len() < 32, "too many pending lookups");
         let id = self.swarm.behaviour_mut().kad.get_record(kind.key(&peer));
         self.lookups.insert(id, Lookup { peer, kind, best: None });
@@ -245,6 +503,10 @@ impl Node {
                 return self.lookup(peer, Kind::Routes);
             }
             self.add_contact_addresses(&contact.routes)?;
+            if !self.store.pending(&peer)?.is_empty() {
+                self.dial_fresh(peer,contact.routes.addresses()?)?;
+            }
+            return Ok(());
         }
         for message in self.store.pending(&peer)? {
             if self.outbound.len() >= 100 { break; }
@@ -264,6 +526,7 @@ impl Node {
                 anyhow::bail!("refreshing contact route; try again after the lookup")
             }
             self.add_contact_addresses(&contact.routes)?;
+            self.dial_fresh(peer,contact.routes.addresses()?)?;
         }
         ensure!(self.exchanges.len() < 128,"too many pending exchange requests");
         Ok(())
@@ -363,6 +626,84 @@ impl Node {
         match command {
             Command::Connect { address } => self.connect(address.parse()?)?,
             Command::Bootstrap => { self.swarm.behaviour_mut().kad.bootstrap()?; }
+            Command::ConfigureNetwork{settings}=>{
+                self.configure(settings,true)?;
+                self.emit(json!({"event":"network_state","state":"configured","nodes":self.seeds.len()})).await?;
+                self.auto_tick().await?;
+                if self.seeds.values().any(|seed|seed.reserved) {
+                    self.emit(json!({"event":"network_state","state":"ready"})).await?;
+                }
+            }
+            Command::NetworkChanged{reset}=>{
+                if reset.unwrap_or(false) {
+                    let peers:Vec<_>=self.seeds.keys().copied().collect();
+                    for peer in peers {
+                        self.clear_seed_listener(peer);
+                        let _=self.swarm.disconnect_peer_id(peer);
+                    }
+                }
+                for seed in self.seeds.values_mut() {seed.next_attempt=Instant::now();seed.backoff=2;}
+                self.refresh_due=Instant::now();
+                self.publish_due=Instant::now();
+                self.auto_tick().await?;
+            }
+            Command::PairRequest{address,name}=>{
+                let addr:Multiaddr=address.parse()?;
+                let peer=match addr.iter().last(){Some(Protocol::P2p(p))=>p,_=>anyhow::bail!("invalid pair address")};
+                ensure!(peer!=self.peer&&self.pair_waiting.len()+self.pair_outbound.len()<MAX_PAIR,"too many pending pair requests");
+                ensure!(!self.pair_waiting.contains_key(&peer)&&!self.pair_outbound.values().any(|p|p.peer==peer),"pair request already pending");
+                let id=uuid::Uuid::new_v4().to_string();
+                let request=PairRequest{id:id.clone(),link:self.invitation(name)?.encode()?};
+                let pending=PairWaiting{peer,request,expires:Instant::now()+Duration::from_secs(25)};
+                if self.swarm.is_connected(&peer) {self.send_pair(pending);} else {
+                    self.connect(addr)?;
+                    self.pair_waiting.insert(peer,pending);
+                }
+                self.emit(json!({"event":"pair_sent","id":id,"peer":peer.to_string()})).await?;
+            }
+            Command::PairAccept{id,name}=>{
+                let pending=self.pair_incoming.remove(&id).context("pair request expired")?;
+                let peer=pending.peer;
+                let result:Result<()> = async {
+                    ensure!(Instant::now()<pending.expires,"pair request expired");
+                    let remote=Invitation::decode(&pending.request.link)?;
+                    ensure!(remote.verify()?==peer,"pair peer mismatch");
+                    let local=self.invitation(name)?.encode()?;
+                    self.add_invitation(&remote).await?;
+                    self.swarm.behaviour_mut().pairing.send_response(pending.channel,PairReply{id:id.clone(),link:Some(local)})
+                        .map_err(|_|anyhow::anyhow!("pair response no longer deliverable"))?;
+                    Ok(())
+                }.await;
+                self.emit(json!({"event":"pair_result","peer":peer.to_string(),"id":id,"ok":result.is_ok(),"error":result.err().map(|e|e.to_string())})).await?;
+            }
+            Command::PairDecline{id}=>{
+                if let Some(pending)=self.pair_incoming.remove(&id) {
+                    let _=self.swarm.behaviour_mut().pairing.send_response(pending.channel,PairReply{id:id.clone(),link:None});
+                }
+                self.emit(json!({"event":"pair_expired","id":id})).await?;
+            }
+            Command::PreviewInvitation{link,token}=>{
+                let result=Invitation::decode(&link);
+                let event=match result {
+                    Ok(invite)=>{let name=match &invite.account.body.payload{Payload::Account{name}=>name.clone(),_=>None};
+                        json!({"event":"invite_preview","token":token,"ok":true,"peer":invite.verify()?.to_string(),"name":name})}
+                    Err(error)=>json!({"event":"invite_preview","token":token,"ok":false,"error":error.to_string()})
+                };
+                self.emit(event).await?;
+            }
+            Command::AppleInvitation{name,token}=>{
+                let result=self.invitation(name).and_then(|i|i.encode());
+                let event=match result {
+                    Ok(link)=>json!({"event":"apple_invite","token":token,"ok":true,"link":link}),
+                    Err(error)=>json!({"event":"apple_invite","token":token,"ok":false,"error":error.to_string()})
+                };
+                self.emit(event).await?;
+            }
+            Command::ImportVerified{link,expected_peer}=>{
+                let invite=Invitation::decode(&link)?;
+                ensure!(invite.verify()?.to_string()==expected_peer,"invitation identity changed");
+                self.add_invitation(&invite).await?;
+            }
             Command::ReserveRelay { address } => self.reserve_relay(address.parse()?)?,
             Command::Announce { address } => {
                 let address = self.normalize_listener(address.parse()?);
@@ -508,6 +849,9 @@ impl Node {
             kad::Event::OutboundQueryProgressed { id, result, step, .. } => match result {
                 kad::QueryResult::PutRecord(result) if step.last => {
                     if let Some(data) = self.publications.remove(&id) {
+                        if result.is_err() && self.auto_config.as_ref().map_or(false,|s|s.enabled) {
+                            self.publish_due=Instant::now()+Duration::from_secs(30);
+                        }
                         // libp2p's quorum confirms protocol-level responses; a remote
                         // node's custom validation decision is not part of that ACK.
                         self.emit(json!({"event":"put","ok":result.is_ok(),"record":data,
@@ -590,20 +934,47 @@ impl Node {
         match event {
             SwarmEvent::NewListenAddr { address, .. } => {
                 let full = self.normalize_listener(address).with(Protocol::P2p(self.peer));
-                self.emit(json!({"event":"listen","address":full.to_string()})).await?;
+                if full.iter().any(|p|p==Protocol::P2pCircuit) { self.publish_due=Instant::now(); }
+                let port=match full.iter().collect::<Vec<_>>().as_slice() {
+                    [Protocol::Ip4(_),Protocol::Tcp(port),Protocol::P2p(_)]=>Some(*port),_=>None
+                };
+                self.emit(json!({"event":"listen","address":full.to_string(),"tcp_port":port})).await?;
+            }
+            SwarmEvent::ListenerClosed{listener_id,..}=>{
+                for seed in self.seeds.values_mut() {
+                    if seed.listener==Some(listener_id) {
+                        seed.listener=None;seed.reserved=false;seed.reservation_deadline=None;
+                        seed.next_attempt=Instant::now()+Duration::from_secs(seed.backoff);
+                        seed.backoff=(seed.backoff*2).min(60);
+                    }
+                }
             }
             SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                 self.emit(json!({"event":"connected","peer":peer_id.to_string(),
                     "route":if endpoint.is_relayed() { "relay" } else { "direct" }})).await?;
+                if let Some(seed)=self.seeds.get_mut(&peer_id) {
+                    seed.backoff=2;seed.next_attempt=Instant::now();
+                    self.emit(json!({"event":"network_state","state":"connected","peer":peer_id.to_string()})).await?;
+                }
+                if let Some(pair)=self.pair_waiting.remove(&peer_id) {self.send_pair(pair);}
                 if self.store.contact(&peer_id)?.is_some() { self.retry(peer_id)?; }
             }
             SwarmEvent::ConnectionClosed { peer_id, num_established:0, .. } => {
+                if self.seeds.contains_key(&peer_id) {
+                    self.clear_seed_listener(peer_id);
+                    self.emit(json!({"event":"network_state","state":"retrying","peer":peer_id.to_string()})).await?;
+                }
                 self.emit(json!({"event":"disconnected","peer":peer_id.to_string()})).await?;
             }
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                 self.emit(json!({"event":"connection_error","peer":peer_id.map(|p| p.to_string()),"error":error.to_string()})).await?;
             }
             SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
+                if let Some(seed)=self.seeds.get_mut(&peer_id) {
+                    seed.supported_relay=info.protocols.iter().any(|p|p.as_ref()==HOP_PROTOCOL);
+                    self.swarm.behaviour_mut().kad.add_address(&peer_id,seed.address.clone());
+                    let _=self.swarm.behaviour_mut().kad.bootstrap();
+                }
                 if info.protocols.iter().any(|p| p.as_ref() == DHT_PROTOCOL) {
                     // This identifies an authenticated connection; addresses remain
                     // discovery hints until a signed routing record is verified.
@@ -614,6 +985,11 @@ impl Node {
                 }
             }
             SwarmEvent::Behaviour(BehaviourEvent::RelayClient(relay::client::Event::ReservationReqAccepted { relay_peer_id, renewal, .. })) => {
+                if let Some(seed)=self.seeds.get_mut(&relay_peer_id) {
+                    seed.reserved=true;seed.reservation_deadline=None;seed.backoff=2;
+                    self.publish_due=Instant::now(); self.refresh_due=Instant::now();
+                    self.emit(json!({"event":"network_state","state":"ready","peer":relay_peer_id.to_string()})).await?;
+                }
                 self.emit(json!({"event":"relay_reserved","relay":relay_peer_id.to_string(),"renewal":renewal})).await?;
             }
             SwarmEvent::Behaviour(BehaviourEvent::Dcutr(event)) => {
@@ -625,6 +1001,7 @@ impl Node {
             SwarmEvent::Behaviour(BehaviourEvent::Kad(event)) => self.on_kad(event).await?,
             SwarmEvent::Behaviour(BehaviourEvent::Messages(event)) => self.on_message(event).await?,
             SwarmEvent::Behaviour(BehaviourEvent::Exchange(event)) => self.on_exchange(event).await?,
+            SwarmEvent::Behaviour(BehaviourEvent::Pairing(event)) => self.on_pair(event).await?,
             _ => {}
         }
         Ok(())
@@ -637,10 +1014,19 @@ pub async fn run(key: identity::Keypair, store: Store, config: Config,
     for address in config.listen { node.swarm.listen_on(address)?; }
     for address in config.bootstrap { node.connect(address)?; }
     node.emit(json!({"event":"started","peer":node.peer.to_string()})).await?;
+    if let Some(saved)=node.store.network_settings()? {
+        let result=serde_json::from_str::<AutoSettings>(&saved).map_err(anyhow::Error::from).and_then(|config|node.configure(config,false));
+        if let Err(error)=result {node.emit(json!({"event":"error","error":format!("saved network configuration: {error}")})).await?;}
+    }
+    let mut automation=tokio::time::interval(Duration::from_secs(3));
+    automation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut cleanup=tokio::time::interval(Duration::from_secs(60));
     loop {
         tokio::select! {
             _=cleanup.tick()=>node.transfers.prune(),
+            _=automation.tick()=>if let Err(error)=node.auto_tick().await {
+                node.emit(json!({"event":"error","error":error.to_string()})).await?;
+            },
             command = commands.recv() => {
                 let Some(command) = command else { break; };
                 match node.command(command).await {

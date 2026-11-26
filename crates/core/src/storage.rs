@@ -51,10 +51,21 @@ impl Store {
                 CREATE INDEX IF NOT EXISTS messages_pending ON messages(peer,direction,delivered,created);
                 PRAGMA user_version=1; COMMIT;")?;
         }
+        db.execute_batch("CREATE TABLE IF NOT EXISTS network_settings (id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL);")?;
         Ok(Self(db, directory.to_path_buf()))
     }
 
     pub fn directory(&self) -> &Path { &self.1 }
+
+    pub fn network_settings(&self) -> Result<Option<String>> {
+        Ok(self.0.query_row("SELECT value FROM network_settings WHERE id=1", [], |r| r.get(0)).optional()?)
+    }
+
+    pub fn set_network_settings(&self, value: &str) -> Result<()> {
+        ensure!(value.len() <= 8192, "network settings too large");
+        self.0.execute("INSERT INTO network_settings VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET value=excluded.value", [value])?;
+        Ok(())
+    }
 
     pub fn next_sequence(&mut self, kind: Kind, own: &PeerId) -> Result<u64> {
         let tx = self.0.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;

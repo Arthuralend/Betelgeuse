@@ -1,6 +1,6 @@
 # Betelgeuse / Бетельгейзе
 
-Rust/libp2p, версия 0.7.0: общее сетевое ядро CLI, iOS и Android, новый режим звонков и файлов.
+Rust/libp2p, версия 0.8.0: общее сетевое ядро CLI, iOS и Android, новый режим звонков и файлов.
 Мобильные сборки 0.3.0 используют прежний протокол; переход на Rust требует
 отдельной проверенной интеграции и миграции идентичности.
 
@@ -126,3 +126,7 @@ bash scripts/build-android.sh
 по умолчанию, совместимость 0.3.0 доступна кнопкой внизу экрана.
 
 Тест нового обмена: `python3 tests/exchange_nodes.py`. См. [инструкцию проверки](docs/QUICKSTART-RU.md).
+
+### 0.8.0
+
+Automated trusted bootstrap and relay, persistent settings, bounded contact-route refresh, new-port TCP dialing, consented nearby peer pairing by native DNS-SD (iOS/Android) and MultipeerConnectivity (Apple), audio graph compatibility fix. See [QUICKSTART-RU.md](docs/QUICKSTART-RU.md).

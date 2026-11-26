@@ -5,3 +5,4 @@ pub mod network;
 pub mod records;
 pub mod storage;
 pub mod exchange;
+mod nearby;

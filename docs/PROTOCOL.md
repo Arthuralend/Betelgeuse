@@ -48,3 +48,21 @@
 - Устройство не принимает произвольный путь от удалённого партнёра.
   Сигнализация и файлы используют Noise/QUIC или защищённое соединение
   через Circuit Relay v2. Relay не маршрутизирует WebRTC-медиа.
+
+## Pairing and trusted bootstrap (0.8.0)
+
+- /betelgeuse/pair/1.0.0: CBOR request {id,link}, response {id,link|null}.
+  A pair offer is a signed Invitation bound to the authenticated PeerId.
+  Save no contact until explicit acceptance by the receiver. The sender
+  imports only a verified reply for its request and peer. Offers expire
+  and pending work is bounded.
+- The local DNS-SD advertisement uses _betelgeuse._tcp and the actual
+  listener port. Peer ID and display name are untrusted hints until
+  verified by the authenticated pairing exchange.
+- Apple-only nearby pairing can use encrypted MultipeerConnectivity to
+  exchange invitations after consent; receiver verifies the signed profile
+  against the advertised Rust Peer ID before offering acceptance.
+- Configured bootstrap nodes are locally persisted and identity-pinned;
+  a detected arbitrary network peer is not automatically trusted as relay.
+  Relay routes are periodically republished; local-only addresses are not
+  part of the automatic DHT route publication.

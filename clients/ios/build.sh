@@ -24,6 +24,9 @@ mkdir -p "$OUT" "$CACHE"
 : "${BETELGEUSE_WEBRTC_FRAMEWORK:?Set path to matching WebRTC.framework}"
 cp Info.plist "$OUT/Info.plist"
 cp Supernova/AppIcon*.png Supernova/ring.wav "$OUT/"
+if [[ -n "${BETELGEUSE_BOOTSTRAP_CONFIG:-}" ]]; then
+  cp "$BETELGEUSE_BOOTSTRAP_CONFIG" "$OUT/bootstrap-local.json"
+fi
 mkdir -p "$OUT/Frameworks"
 cp -R "$BETELGEUSE_WEBRTC_FRAMEWORK" "$OUT/Frameworks/WebRTC.framework"
 rm -rf "$OUT/Frameworks/WebRTC.framework/Headers" "$OUT/Frameworks/WebRTC.framework/Modules"
@@ -39,14 +42,14 @@ swiftc -parse-as-library -sdk "$SDK" -target "$TARGET" -O -swift-version 5 \
   -o "$OUT/Supernova" \
   Supernova/SupernovaApp.swift Supernova/ContentView.swift \
   Supernova/MeshService.swift Supernova/CryptoBox.swift Supernova/Keychain.swift Supernova/CallAudio.swift Supernova/LocalNotifications.swift \
-  Supernova/DirectIdentity.swift Supernova/DirectProfile.swift Supernova/DirectLink.swift Supernova/DirectSession.swift Supernova/DirectView.swift Supernova/RelayTunnel.swift Supernova/RustNetworkView.swift Supernova/RustCall.swift "$BETELGEUSE_CORE_LIB"
+  Supernova/DirectIdentity.swift Supernova/DirectProfile.swift Supernova/DirectLink.swift Supernova/DirectSession.swift Supernova/DirectView.swift Supernova/RelayTunnel.swift Supernova/RustNetworkView.swift Supernova/RustCall.swift Supernova/NearbyDiscovery.swift Supernova/ApplePair.swift "$BETELGEUSE_CORE_LIB"
 
 if [ "$MODE" != "simulator" ]; then
   mkdir -p build/ipa/Payload
   cp -R "$OUT" build/ipa/Payload/
-  rm -f Betelgeuse-0.7.1-iPhone-unsigned.ipa
-  (cd build/ipa && zip -qry ../../Betelgeuse-0.7.1-iPhone-unsigned.ipa Payload)
-  echo "Built: $(pwd)/Betelgeuse-0.7.1-iPhone-unsigned.ipa"
+  rm -f Betelgeuse-0.8.0-iPhone-unsigned.ipa
+  (cd build/ipa && zip -qry ../../Betelgeuse-0.8.0-iPhone-unsigned.ipa Payload)
+  echo "Built: $(pwd)/Betelgeuse-0.8.0-iPhone-unsigned.ipa"
 else
   echo "Built: $(pwd)/$OUT"
 fi

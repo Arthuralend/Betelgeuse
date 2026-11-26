@@ -294,20 +294,21 @@ final class MeshService: NSObject, ObservableObject {
     }
 
     private func startCallAudio() {
-        guard !skipCallAudio else { return }
+        guard !skipCallAudio, callAudio == nil else { return }
         stopRingtone()
         let audio = CallAudio()
         audio.onAudio = { [weak self] pcm in
-            guard let self, let peer = self.callPeer, self.call?.phase == .active else { return }
-            var packet = Data([0xA1])
-            packet.append(pcm)
-            try? self.session.send(packet, toPeers: [peer], with: .unreliable)
+            DispatchQueue.main.async {
+                guard let self, let peer = self.callPeer, self.call?.phase == .active else { return }
+                var packet = Data([0xA1]); packet.append(pcm)
+                try? self.session.send(packet, toPeers: [peer], with: .unreliable)
+            }
         }
         audio.onError = { [weak self] message in
-            DispatchQueue.main.async { self?.callError = message }
+            DispatchQueue.main.async { self?.callError = message; self?.hangUp() }
         }
-        audio.start()
         callAudio = audio
+        audio.start()
     }
 
     private func startRingtone() {
@@ -439,6 +440,10 @@ final class MeshService: NSObject, ObservableObject {
 
 extension MeshService: MCSessionDelegate {
     func session(_ session: MCSession, peer peerID: MCPeerID, didChange state: MCSessionState) {
+        DispatchQueue.main.async { [weak self] in self?.processSessionState(peerID, state) }
+    }
+
+    private func processSessionState(_ peerID: MCPeerID, _ state: MCSessionState) {
         switch state {
         case .connected:
             sendHello(to: peerID)
@@ -468,9 +473,14 @@ extension MeshService: MCSessionDelegate {
     }
 
     func session(_ session: MCSession, didReceive data: Data, fromPeer peerID: MCPeerID) {
+        guard data.count <= 64 * 1024 else { return }
+        DispatchQueue.main.async { [weak self] in self?.processReceived(data, from: peerID) }
+    }
+
+    private func processReceived(_ data: Data, from peerID: MCPeerID) {
         if data.first == 0xA1 {
             guard call?.phase == .active, peerID == callPeer, callAudio != nil else { return }
-            callAudio?.receive(data.dropFirst())
+            callAudio?.receive(Data(data.dropFirst()))
             return
         }
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
