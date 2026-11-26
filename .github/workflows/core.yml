@@ -31,6 +31,8 @@ jobs:
         run: python3 tests/two_nodes.py --require-qr
       - name: Three peers through Circuit Relay v2
         run: python3 tests/relay_nodes.py
+      - name: Signaling and file transfer between real peers
+        run: python3 tests/exchange_nodes.py
       - name: Package executable and lockfile
         run: cargo build --locked --release -p betelgeuse
       - uses: actions/upload-artifact@v4
@@ -69,6 +71,7 @@ jobs:
             Cargo.lock
 
   ios:
+    if: github.ref == 'refs/heads/main'
     name: iOS IPA and XCFramework
     runs-on: macos-15
     timeout-minutes: 35
@@ -107,6 +110,7 @@ jobs:
           path: dist/Betelgeuse-0.6.0-iPhone-unsigned.ipa
 
   android:
+    if: github.ref == 'refs/heads/main'
     name: Android JNI and APK
     runs-on: ubuntu-latest
     timeout-minutes: 35

@@ -56,7 +56,7 @@ impl BglEngine {
     }
 
     fn command(&self, json: &str) -> Result<()> {
-        anyhow::ensure!(json.len() <= 32768, "command too large");
+        anyhow::ensure!(json.len() <= 65536, "command too large");
         let command = serde_json::from_str::<Command>(json)?;
         self.commands.as_ref().context("engine stopped")?.try_send(command).context("engine unavailable or busy")?;
         Ok(())

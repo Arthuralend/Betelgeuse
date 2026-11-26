@@ -1,5 +1,6 @@
 use crate::{
     invitations::Invitation,
+    exchange::{Request as Exchange, Reply as ExchangeReply, Signal, Transfers},
     records::{now_ms, Kind, Payload, SignedRecord, MAX_RECORD},
     storage::{Message, Store},
 };
@@ -20,6 +21,7 @@ use tokio::sync::mpsc;
 
 const DHT_PROTOCOL: &str = "/betelgeuse/kad/1.0.0";
 const MESSAGE_PROTOCOL: &str = "/betelgeuse/message/1.0.0";
+const EXCHANGE_PROTOCOL: &str = "/betelgeuse/exchange/1.0.0";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -30,6 +32,7 @@ struct Behaviour {
     kad: kad::Behaviour<MemoryStore>,
     identify: identify::Behaviour,
     messages: request_response::cbor::Behaviour<Message, Ack>,
+    exchange: request_response::cbor::Behaviour<Exchange, ExchangeReply>,
     ping: ping::Behaviour,
     relay_client: relay::client::Behaviour,
     relay_server: Toggle<relay::Behaviour>,
@@ -53,6 +56,13 @@ pub enum Command {
     History { peer: String },
     Send { peer: String, text: String },
     Retry { peer: String },
+    CallSignal { peer: String, id: String, signal: Signal },
+    FileSend { peer: String, path: String, name: Option<String> },
+    FileAccept { peer: String, id: String },
+    FilePause { peer: String, id: String },
+    FileResume { peer: String, id: String },
+    FileCancel { peer: String, id: String },
+    Files,
     Status,
     Quit,
 }
@@ -78,6 +88,8 @@ struct Node {
     lookups: HashMap<kad::QueryId, Lookup>,
     publications: HashMap<kad::QueryId, SignedRecord>,
     outbound: HashMap<request_response::OutboundRequestId, (PeerId, String)>,
+    exchanges: HashMap<request_response::OutboundRequestId,(PeerId,Exchange)>,
+    transfers: Transfers,
     events: mpsc::Sender<Value>,
     routed: HashSet<PeerId>,
     server: bool,
@@ -86,6 +98,7 @@ struct Node {
 impl Node {
     fn new(key: identity::Keypair, store: Store, server: bool, relay_server: bool, events: mpsc::Sender<Value>) -> Result<Self> {
         let peer = key.public().to_peer_id();
+        let transfers = Transfers::new(store.directory())?;
         let mut kconfig = kad::Config::new(StreamProtocol::new(DHT_PROTOCOL));
         kconfig.set_record_filtering(kad::StoreInserts::FilterBoth)
             .set_caching(kad::Caching::Disabled)
@@ -120,16 +133,25 @@ impl Node {
             messages: request_response::cbor::Behaviour::with_codec(codec,
                 [(StreamProtocol::new(MESSAGE_PROTOCOL), request_response::ProtocolSupport::Full)],
                 message_config),
+            exchange: request_response::cbor::Behaviour::with_codec(
+                request_response::cbor::codec::Codec::default()
+                    .set_request_size_maximum(65_536).set_response_size_maximum(131_072),
+                [(StreamProtocol::new(EXCHANGE_PROTOCOL), request_response::ProtocolSupport::Full)],
+                request_response::Config::default().with_request_timeout(Duration::from_secs(30))
+                    .with_max_concurrent_streams(32)),
             ping: ping::Behaviour::default(),
             relay_client,
-            relay_server: Toggle::from(relay_server.then(|| relay::Behaviour::new(peer, relay::Config::default()))),
+            relay_server: Toggle::from(relay_server.then(|| relay::Behaviour::new(peer, relay::Config {
+                max_circuit_bytes: 1024 * 1024 * 1024, max_circuit_duration: Duration::from_secs(900),
+                ..relay::Config::default()
+            }))),
             dcutr: dcutr::Behaviour::new(peer),
             autonat: autonat::Behaviour::new(peer, autonat::Config::default()),
         })?
             .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(120)))
             .build();
         Ok(Self { swarm, store, key, peer, lookups: HashMap::new(), publications: HashMap::new(),
-            outbound: HashMap::new(), events, routed: HashSet::new(), server })
+            outbound: HashMap::new(), exchanges: HashMap::new(), transfers, events, routed: HashSet::new(), server })
     }
 
     async fn emit(&self, value: Value) -> Result<()> {
@@ -232,6 +254,108 @@ impl Node {
         Ok(())
     }
 
+    fn prepare_exchange(&mut self, peer: PeerId) -> Result<()> {
+        let contact = self.store.contact(&peer)?.context("add this contact first")?;
+        if !self.swarm.is_connected(&peer) {
+            if contact.routes.verify(now_ms()?).is_err() {
+                self.lookup(peer,Kind::Routes)?;
+                anyhow::bail!("refreshing contact route; try again after the lookup")
+            }
+            self.add_contact_addresses(&contact.routes)?;
+        }
+        ensure!(self.exchanges.len() < 128,"too many pending exchange requests");
+        Ok(())
+    }
+
+    fn exchange(&mut self, peer: PeerId, request: Exchange) -> Result<()> {
+        ensure!(self.exchanges.len() < 128, "too many pending exchange requests");
+        let outbound = self.swarm.behaviour_mut().exchange.send_request(&peer,request.clone());
+        self.exchanges.insert(outbound,(peer,request));
+        Ok(())
+    }
+
+    async fn exchange_failure(&mut self, peer: PeerId, request: Exchange, error: String) -> Result<()> {
+        let id = request.id().to_owned();
+        match request {
+            Exchange::Signal { signal, .. } => self.emit(json!({"event":"call_delivery","peer":peer.to_string(),"id":id,"signal":signal,"ok":false,"error":error})).await?,
+            Exchange::FilePull { .. } => {
+                self.transfers.fail_pull(peer,&id);
+                self.emit(json!({"event":"file_paused","peer":peer.to_string(),"id":id,"error":error})).await?;
+            }
+            Exchange::FileOffer { .. } => {
+                self.transfers.cancel(peer,&id);
+                self.emit(json!({"event":"file_failed","peer":peer.to_string(),"id":id,"error":error})).await?;
+            }
+            Exchange::FileFinish { .. } => self.emit(json!({"event":"file_ack_failed","peer":peer.to_string(),"id":id,"error":error})).await?,
+            Exchange::FileCancel { .. } => {}
+        }
+        Ok(())
+    }
+
+    async fn on_exchange(&mut self, event: request_response::Event<Exchange,ExchangeReply>) -> Result<()> {
+        match event {
+            request_response::Event::Message { peer, message, .. } => match message {
+                request_response::Message::Request { request,channel,.. } => {
+                    let id=request.id().to_owned();
+                    let response=if self.store.contact(&peer)?.is_some() {
+                        self.transfers.receive(peer,request)
+                    } else { Err(anyhow::anyhow!("unknown contact")) };
+                    match response {
+                        Ok((reply, event)) => {
+                            let _=self.swarm.behaviour_mut().exchange.send_response(channel,reply);
+                            if let Some(event)=event { self.emit(event).await?; }
+                        }
+                        Err(_) => {
+                            let _=self.swarm.behaviour_mut().exchange.send_response(channel,ExchangeReply::Ack { id,accepted:false });
+                        }
+                    }
+                }
+                request_response::Message::Response { request_id,response } => {
+                    let Some((expected,request))=self.exchanges.remove(&request_id) else {return Ok(())};
+                    let id=request.id().to_owned();
+                    if expected!=peer {
+                        return self.exchange_failure(expected,request,"unexpected peer".into()).await;
+                    }
+                    match (&request,response) {
+                        (Exchange::FilePull { offset,.. },ExchangeReply::Chunk { id:received_id,offset:received_offset,data })
+                            if received_id==id && received_offset==*offset => {
+                                match self.transfers.chunk(peer,id.clone(),received_offset,data) {
+                                    Ok((next,event)) => {
+                                        if event["event"]=="file_progress" {
+                                            // Coalesce progress events to avoid blocking the network actor.
+                                            if event["received"].as_u64().unwrap_or(0) % (256 * 1024) == 0 || event["active"]==false {
+                                                let _=self.events.try_send(event);
+                                            }
+                                        } else { self.emit(event).await?; }
+                                        if let Some(next)=next {
+                                            if let Err(error)=self.exchange(peer,next.clone()) {
+                                                self.exchange_failure(peer,next,error.to_string()).await?;
+                                            }
+                                        }
+                                    }
+                                    Err(error) => {
+                                        self.transfers.cancel(peer,&id);
+                                        self.emit(json!({"event":"file_failed","peer":peer.to_string(),"id":id,"error":error.to_string()})).await?;
+                                        let _=self.exchange(peer,Exchange::FileCancel{id});
+                                    }
+                                }
+                            }
+                        (_,ExchangeReply::Ack{id:received_id,accepted:true}) if received_id==id &&
+                            !matches!(request,Exchange::FilePull { .. }) => {}
+                        _ => self.exchange_failure(peer,request,"request rejected or invalid response".into()).await?,
+                    }
+                }
+            },
+            request_response::Event::OutboundFailure { peer,request_id,error,.. } => {
+                if let Some((_,request))=self.exchanges.remove(&request_id) {
+                    self.exchange_failure(peer,request,error.to_string()).await?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     async fn command(&mut self, command: Command) -> Result<bool> {
         match command {
             Command::Connect { address } => self.connect(address.parse()?)?,
@@ -285,6 +409,45 @@ impl Node {
                 self.retry(peer)?;
             }
             Command::Retry { peer } => self.retry(peer.parse()?)?,
+            Command::CallSignal { peer,id,signal } => {
+                let peer:PeerId=peer.parse()?;
+                ensure!(uuid::Uuid::parse_str(&id)?.to_string()==id,"invalid call id");
+                signal.validate()?;
+                self.prepare_exchange(peer)?;
+                self.exchange(peer,Exchange::Signal{id,signal})?;
+            }
+            Command::Files => self.emit(json!({"event":"files","files":self.transfers.received()?})).await?,
+            Command::FileSend { peer,path,name } => {
+                let peer:PeerId=peer.parse()?;
+                self.prepare_exchange(peer)?;
+                let prepared=tokio::task::spawn_blocking(move || Transfers::prepare(path.into(),name)).await??;
+                let (request,event)=self.transfers.offer(peer,prepared)?;
+                self.exchange(peer,request)?;
+                self.emit(event).await?;
+            }
+            Command::FileAccept { peer,id } => {
+                let peer:PeerId=peer.parse()?;
+                self.prepare_exchange(peer)?;
+                let request=self.transfers.accept(peer,id)?;
+                self.exchange(peer,request)?;
+            }
+            Command::FilePause { peer,id } => {
+                let peer:PeerId=peer.parse()?;
+                self.transfers.pause(peer,&id)?;
+                self.emit(json!({"event":"file_paused","peer":peer.to_string(),"id":id})).await?;
+            }
+            Command::FileResume { peer,id } => {
+                let peer:PeerId=peer.parse()?;
+                self.prepare_exchange(peer)?;
+                let request=self.transfers.resume(peer,id)?;
+                self.exchange(peer,request)?;
+            }
+            Command::FileCancel { peer,id } => {
+                let peer:PeerId=peer.parse()?;
+                self.transfers.cancel(peer,&id);
+                if self.prepare_exchange(peer).is_ok() { let _=self.exchange(peer,Exchange::FileCancel{id:id.clone()}); }
+                self.emit(json!({"event":"file_cancelled","peer":peer.to_string(),"id":id})).await?;
+            }
             Command::Status => {
                 let connected: Vec<_> = self.swarm.connected_peers().map(ToString::to_string).collect();
                 let listeners: Vec<_> = self.swarm.listeners().map(ToString::to_string).collect();
@@ -437,6 +600,7 @@ impl Node {
             }
             SwarmEvent::Behaviour(BehaviourEvent::Kad(event)) => self.on_kad(event).await?,
             SwarmEvent::Behaviour(BehaviourEvent::Messages(event)) => self.on_message(event).await?,
+            SwarmEvent::Behaviour(BehaviourEvent::Exchange(event)) => self.on_exchange(event).await?,
             _ => {}
         }
         Ok(())
@@ -449,8 +613,10 @@ pub async fn run(key: identity::Keypair, store: Store, config: Config,
     for address in config.listen { node.swarm.listen_on(address)?; }
     for address in config.bootstrap { node.connect(address)?; }
     node.emit(json!({"event":"started","peer":node.peer.to_string()})).await?;
+    let mut cleanup=tokio::time::interval(Duration::from_secs(60));
     loop {
         tokio::select! {
+            _=cleanup.tick()=>node.transfers.prune(),
             command = commands.recv() => {
                 let Some(command) = command else { break; };
                 match node.command(command).await {

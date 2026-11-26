@@ -5,7 +5,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{path::Path, time::Duration};
 
-pub struct Store(Connection);
+pub struct Store(Connection, std::path::PathBuf);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Contact {
@@ -51,8 +51,10 @@ impl Store {
                 CREATE INDEX IF NOT EXISTS messages_pending ON messages(peer,direction,delivered,created);
                 PRAGMA user_version=1; COMMIT;")?;
         }
-        Ok(Self(db))
+        Ok(Self(db, directory.to_path_buf()))
     }
+
+    pub fn directory(&self) -> &Path { &self.1 }
 
     pub fn next_sequence(&mut self, kind: Kind, own: &PeerId) -> Result<u64> {
         let tx = self.0.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;

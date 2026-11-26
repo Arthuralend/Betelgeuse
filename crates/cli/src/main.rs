@@ -85,7 +85,7 @@ async fn main() -> Result<()> {
                     tokio::select! {
                         result = lines.next_line() => match result {
                             Ok(Some(line)) => {
-                                if line.len() > 32_768 {
+                                if line.len() > 65_536 {
                                     eprintln!("command too large");
                                     continue;
                                 }
