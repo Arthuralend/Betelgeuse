@@ -141,6 +141,9 @@ struct Node {
     pair_incoming: HashMap<String, PairIncoming>,
     pair_waiting: HashMap<PeerId, PairWaiting>,
     pair_outbound: HashMap<request_response::OutboundRequestId, PairOutbound>,
+    waiting_exchanges: Vec<(PeerId, Exchange, Instant)>,
+    retry_due: HashMap<PeerId, Instant>,
+    retry_index: usize,
 }
 
 impl Node {
@@ -209,7 +212,7 @@ impl Node {
         Ok(Self { swarm, store, key, peer, lookups: HashMap::new(), publications: HashMap::new(),
             outbound: HashMap::new(), exchanges: HashMap::new(), transfers, events, routed: HashSet::new(), server,
             auto_config:None, seeds:HashMap::new(), publish_due:Instant::now(), refresh_due:Instant::now(), refresh_index:0,
-            pair_incoming:HashMap::new(),pair_waiting:HashMap::new(),pair_outbound:HashMap::new() })
+            pair_incoming:HashMap::new(),pair_waiting:HashMap::new(),pair_outbound:HashMap::new(), waiting_exchanges:Vec::new(),retry_due:HashMap::new(),retry_index:0 })
     }
 
     async fn emit(&self, value: Value) -> Result<()> {
@@ -341,6 +344,25 @@ impl Node {
                     Err(_)=>{seed.backoff=(seed.backoff*2).min(60);}
                 }
             }
+        }
+        let mut expired=Vec::new();
+        self.waiting_exchanges.retain(|(peer,request,deadline)| {
+            if now>=*deadline {expired.push((*peer,request.clone()));false} else {true}
+        });
+        for (peer,request) in expired {self.exchange_failure(peer,request,"contact connection timed out".into()).await?;}
+        let contacts=self.store.contacts()?;
+        if !contacts.is_empty() {
+            for step in 0..contacts.len().min(8) {
+                if let Ok(peer)=contacts[(self.retry_index+step)%contacts.len()].peer.parse::<PeerId>() {
+                    if self.retry_due.get(&peer).map_or(true,|at|now>=*at) &&
+                       (!self.store.pending(&peer)?.is_empty()||self.waiting_exchanges.iter().any(|(p,_,_)|*p==peer)) {
+                        self.retry_due.insert(peer,now+Duration::from_secs(12));
+                        if !self.swarm.is_connected(&peer)&&self.lookups.len()<24 {let _=self.lookup(peer,Kind::Routes);}
+                        let _=self.retry(peer);
+                    }
+                }
+            }
+            self.retry_index=(self.retry_index+contacts.len().min(8))%contacts.len();
         }
         let Some(settings)=self.auto_config.clone().filter(|s|s.enabled) else {return Ok(());};
         let ready_count=self.seeds.values().filter(|s|s.reserved).count();
@@ -494,48 +516,56 @@ impl Node {
         Ok(())
     }
 
-    fn retry(&mut self, peer: PeerId) -> Result<()> {
-        if self.outbound.len() >= 100 { return Ok(()); }
-        let Some(contact) = self.store.contact(&peer)? else { return Ok(()); };
-        // Expired addresses cannot be used to seed a new dial.
-        if !self.swarm.is_connected(&peer) {
-            if contact.routes.verify(now_ms()?).is_err() {
-                return self.lookup(peer, Kind::Routes);
+    // A configured, authenticated relay can route to an existing contact by PeerId.
+    // Do not depend exclusively on a cached LAN address or an expired invitation.
+    fn contact_dial(&mut self, peer:PeerId) -> Result<()> {
+        let contact=self.store.contact(&peer)?.context("add this contact first")?;
+        if self.swarm.is_connected(&peer) {return Ok(());}
+        let mut addresses=Vec::new();
+        for seed in self.seeds.values().filter(|seed|seed.reserved) {
+            addresses.push(seed.address.clone().with(Protocol::P2pCircuit).with(Protocol::P2p(peer)));
+        }
+        if contact.routes.verify(now_ms()?).is_ok() {
+            for addr in contact.routes.addresses()? {
+                if !addresses.contains(&addr) {addresses.push(addr);}
             }
-            self.add_contact_addresses(&contact.routes)?;
-            if !self.store.pending(&peer)?.is_empty() {
-                self.dial_fresh(peer,contact.routes.addresses()?)?;
+        }
+        if !addresses.is_empty() {self.dial_fresh(peer,addresses)?;}
+        Ok(())
+    }
+
+    fn retry(&mut self, peer: PeerId) -> Result<()> {
+        if self.outbound.len() >= 100||self.store.contact(&peer)?.is_none() {return Ok(());}
+        if !self.swarm.is_connected(&peer) {
+            if !self.store.pending(&peer)?.is_empty() || self.waiting_exchanges.iter().any(|(p,_,_)|*p==peer) {
+                self.contact_dial(peer)?;
             }
             return Ok(());
         }
         for message in self.store.pending(&peer)? {
-            if self.outbound.len() >= 100 { break; }
-            if self.outbound.values().any(|(p, id)| *p == peer && *id == message.id) { continue; }
-            let id = message.id.clone();
-            let request = self.swarm.behaviour_mut().messages.send_request(&peer, message);
-            self.outbound.insert(request, (peer, id));
+            if self.outbound.len() >= 100 {break;}
+            if self.outbound.values().any(|(p,id)|*p==peer&&*id==message.id) {continue;}
+            let id=message.id.clone();
+            let request=self.swarm.behaviour_mut().messages.send_request(&peer,message);
+            self.outbound.insert(request,(peer,id));
         }
         Ok(())
     }
 
-    fn prepare_exchange(&mut self, peer: PeerId) -> Result<()> {
-        let contact = self.store.contact(&peer)?.context("add this contact first")?;
+    fn prepare_exchange(&mut self, peer:PeerId) -> Result<()> {
+        ensure!(self.store.contact(&peer)?.is_some(),"add this contact first");
+        ensure!(self.exchanges.len()+self.waiting_exchanges.len()<128,"too many pending exchange requests");
+        Ok(())
+    }
+    fn exchange(&mut self,peer:PeerId,request:Exchange) -> Result<()> {
+        ensure!(self.exchanges.len()+self.waiting_exchanges.len()<128,"too many pending exchange requests");
         if !self.swarm.is_connected(&peer) {
-            if contact.routes.verify(now_ms()?).is_err() {
-                self.lookup(peer,Kind::Routes)?;
-                anyhow::bail!("refreshing contact route; try again after the lookup")
-            }
-            self.add_contact_addresses(&contact.routes)?;
-            self.dial_fresh(peer,contact.routes.addresses()?)?;
+            self.contact_dial(peer)?;
+            self.waiting_exchanges.push((peer,request,Instant::now()+Duration::from_secs(15)));
+        } else {
+            let outbound=self.swarm.behaviour_mut().exchange.send_request(&peer,request.clone());
+            self.exchanges.insert(outbound,(peer,request));
         }
-        ensure!(self.exchanges.len() < 128,"too many pending exchange requests");
-        Ok(())
-    }
-
-    fn exchange(&mut self, peer: PeerId, request: Exchange) -> Result<()> {
-        ensure!(self.exchanges.len() < 128, "too many pending exchange requests");
-        let outbound = self.swarm.behaviour_mut().exchange.send_request(&peer,request.clone());
-        self.exchanges.insert(outbound,(peer,request));
         Ok(())
     }
 
@@ -915,7 +945,8 @@ impl Node {
                         let delivered = peer == expected && response.id == id && response.accepted;
                         if delivered { self.store.delivered(&peer, &id)?; }
                         self.emit(json!({"event":"delivery","peer":peer.to_string(),"id":id,"ok":delivered})).await?;
-                        // Do not loop on negative acknowledgments.
+                        // Space retries after a negative acknowledgment.
+                        if !delivered {self.retry_due.insert(peer,Instant::now()+Duration::from_secs(60));}
                         if delivered { self.retry(peer)?; }
                     }
                 }
@@ -957,6 +988,11 @@ impl Node {
                     self.emit(json!({"event":"network_state","state":"connected","peer":peer_id.to_string()})).await?;
                 }
                 if let Some(pair)=self.pair_waiting.remove(&peer_id) {self.send_pair(pair);}
+                let mut queued=Vec::new();
+                self.waiting_exchanges.retain(|(p,r,deadline)|{
+                    if *p==peer_id&&Instant::now()<*deadline {queued.push(r.clone());false}else{true}
+                });
+                for request in queued {self.exchange(peer_id,request)?;}
                 if self.store.contact(&peer_id)?.is_some() { self.retry(peer_id)?; }
             }
             SwarmEvent::ConnectionClosed { peer_id, num_established:0, .. } => {
@@ -967,6 +1003,7 @@ impl Node {
                 self.emit(json!({"event":"disconnected","peer":peer_id.to_string()})).await?;
             }
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                if let Some(peer)=peer_id {if self.store.contact(&peer)?.is_some(){self.retry_due.insert(peer,Instant::now()+Duration::from_secs(6));}}
                 self.emit(json!({"event":"connection_error","peer":peer_id.map(|p| p.to_string()),"error":error.to_string()})).await?;
             }
             SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {

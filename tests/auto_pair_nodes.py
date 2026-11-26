@@ -52,6 +52,11 @@ def run(binary):
             a=Node(binary,root/"alice");nodes.append(a)
             a.wait("network_state",lambda e:e["state"]=="ready",timeout=45)
             a.send(op="contacts");assert a.wait("contacts")["contacts"][0]["peer"]==bid
+            # Replace the cached contact route with an authenticated but unavailable
+            # LAN address. The trusted relay must still deliver to the known PeerId.
+            b.send(op="invite",name="Bob",addresses=["/ip4/127.0.0.1/tcp/1"])
+            link=b.wait("invite")["link"]
+            a.send(op="import",link=link);a.wait("contact")
             a.send(op="send",peer=bid,text="after restart")
             assert b.wait("message")["text"]=="after restart"
             assert a.wait("delivery")["ok"]
