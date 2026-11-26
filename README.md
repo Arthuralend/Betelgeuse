@@ -1,3 +1,88 @@
-# Betelgeuse
+# Betelgeuse / Бетельгейзе
 
-Decentralized messenger. The Rust/libp2p prototype is in development; builds and tests are tracked separately from the mobile releases.
+Rust/libp2p, стадия 1 (0.4.0, CLI). Ветка разработки общего сетевого ядра.
+Мобильные сборки 0.3.0 используют прежний протокол; переход на Rust требует
+отдельной проверенной интеграции и миграции идентичности.
+
+### Сборка и проверка
+
+```sh
+rustup update stable
+cargo generate-lockfile
+cargo test --workspace --locked
+cargo build -p betelgeuse --locked
+python3 tests/two_nodes.py
+```
+
+Для проверки сканирования QR установите `rsvg-convert` и `zbarimg` и добавьте
+`--require-qr`. В GitHub Actions Linux запускает этот тест обязательно.
+Затем macOS runner делает сборку с тем же Cargo.lock.
+
+### Два узла
+
+Первый терминал:
+
+```sh
+cargo run -p betelgeuse -- --data-dir ./alice account create
+cargo run -p betelgeuse -- --data-dir ./alice node start --server
+```
+
+Скопируйте полный адрес из события `listen`. Второй терминал:
+
+```sh
+cargo run -p betelgeuse -- --data-dir ./bob account create
+cargo run -p betelgeuse -- --data-dir ./bob node start --server --bootstrap '<адрес Alice с /p2p/PeerID>'
+```
+
+Для интернета оператор узла может указать слушающий интерфейс и реальный
+публично доступный адрес; автоматические NAT traversal и ретрансляция
+требуют следующего этапа. Локальный CLI по умолчанию привязан к loopback.
+`--server` разрешает обслуживание DHT, без флага узел работает клиентом.
+Начальный адрес берётся из приглашения или списка bootstrap, фиксированного
+узла разработчика нет.
+
+Активный процесс принимает JSON-строки через stdin; stdout возвращает события:
+
+```jsonl
+{"op":"status"}
+{"op":"connect","address":"/ip4/127.0.0.1/tcp/4001/p2p/<PeerID>"}
+{"op":"bootstrap"}
+{"op":"invite","name":"Alice","qr_path":"alice.svg"}
+{"op":"import","link":"betelgeuse://v1/..."}
+{"op":"contacts"}
+{"op":"put","name":"Alice"}
+{"op":"publish_routes"}
+{"op":"get","peer":"<PeerID>","kind":"account"}
+{"op":"get","peer":"<PeerID>","kind":"routes"}
+{"op":"send","peer":"<PeerID>","text":"Hello"}
+{"op":"retry","peer":"<PeerID>"}
+{"op":"quit"}
+```
+
+Для приглашения и публикации маршрутов можно явно передать `addresses` —
+массив direct multiaddr без `/p2p`. По умолчанию берутся адреса listeners.
+Приглашение не является секретом авторизации: оно подтверждает профиль и
+маршрут. Два собеседника должны осознанно обменяться приглашениями.
+Сообщения от неизвестных контактов отклоняются; исходящие хранятся до ACK,
+повтор отправляется по команде retry или при новом соединении.
+
+### Где хранится информация
+
+В приватной директории аккаунта: `identity.pb` (Ed25519), `state.sqlite3`
+(контакты, сообщения, максимальные версии записей). История CLI
+защищена файловыми разрешениями, дополнительное шифрование базы ожидает
+выбора стандартного решения. Сохранение и восстановление CLI-идентичности:
+остановить узел, безопасно скопировать всю приватную директорию в
+зашифрованное резервное хранилище, при восстановлении вернуть права 700/600.
+
+### Статус проверки
+
+Результаты компиляции и сетевого теста определяет GitHub Actions. На Mac
+первоначальная сборка была недоступна из-за отсутствия Rust/Cargo,
+ограниченного доступа к реестру crates и недостатка свободного места.
+Состояние первого этапа нельзя считать подтверждённым до успешного CI.
+
+Завершающий продукт с XCFramework, Android JNI, WebRTC, DCUtR, AutoNAT,
+Circuit Relay, мобильным интерфейсом, защищённой миграцией 0.3.0
+и установочными IPA/APK будет следующим этапом. CLI ещё не совместим
+по сети с версией 0.3.0.
