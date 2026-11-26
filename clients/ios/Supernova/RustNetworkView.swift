@@ -386,10 +386,14 @@ struct RustNetworkView: View {
     @AppStorage("rust.ice") private var ice = ""
     @State private var turnUser=""
     @State private var turnPassword=""
+    @State private var turnLoaded=false
+    @State private var turnSaved=""
     @State private var pickingFile=false
     @State private var settingsOpen=false
     @State private var chatOpen=false
     @State private var search=""
+    @State private var callsOpen=false
+    @State private var confirmClearCalls=false
     private var accent:Color { Color(red: 0.97,green:0.53,blue:0.22) }
     private var selectedName:String { core.contacts.first(where:{$0.id==core.selected})?.name ?? "Переписка" }
     private var settings:CallIceSettings { CallIceSettings(urls:ice,username:turnUser,password:turnPassword) }
@@ -398,6 +402,22 @@ struct RustNetworkView: View {
     @State private var input = ""
     @State private var peer = ""
     @State private var text = ""
+
+    private func loadTurnCredentials() {
+        let query:[String:Any]=[kSecClass as String:kSecClassGenericPassword,kSecAttrService as String:"Betelgeuse.turn",kSecAttrAccount as String:"credentials",kSecReturnData as String:true,kSecMatchLimit as String:kSecMatchLimitOne]
+        var result:CFTypeRef?
+        if SecItemCopyMatching(query as CFDictionary,&result)==errSecSuccess,let data=result as? Data,let values=try? JSONDecoder().decode([String].self,from:data),values.count==2 {turnUser=values[0];turnPassword=values[1]}
+    }
+    private func saveTurnCredentials() {
+        let identity:[String:Any]=[kSecClass as String:kSecClassGenericPassword,kSecAttrService as String:"Betelgeuse.turn",kSecAttrAccount as String:"credentials"]
+        guard let data=try? JSONEncoder().encode([turnUser,turnPassword]) else{return}
+        let updated=SecItemUpdate(identity as CFDictionary,[kSecValueData as String:data] as CFDictionary)
+        if updated==errSecSuccess {turnSaved="Параметры сохранены";return}
+        if updated==errSecItemNotFound {
+            var query=identity;query[kSecValueData as String]=data;query[kSecAttrAccessible as String]=kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            turnSaved=SecItemAdd(query as CFDictionary,nil)==errSecSuccess ? "Параметры сохранены" : "Не удалось сохранить данные"
+        } else {turnSaved="Не удалось сохранить данные"}
+    }
 
     private func configure() {
         guard core.ready else{return}
@@ -524,8 +544,11 @@ struct RustNetworkView: View {
                     TextField("STUN/TURN URL",text:$ice).textInputAutocapitalization(.never).autocorrectionDisabled()
                     TextField("TURN логин",text:$turnUser).textInputAutocapitalization(.never)
                     SecureField("TURN пароль",text:$turnPassword)
+                    Button("Сохранить параметры звонков"){saveTurnCredentials()}
+                    if !turnSaved.isEmpty {Text(turnSaved).font(.caption).foregroundStyle(.secondary)}
                     if ice.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty { Text("Без STUN/TURN звонки между разными сетями могут не соединиться.").font(.caption).foregroundStyle(.orange) }
                     if !call.status.isEmpty { Text(call.status).foregroundStyle(.secondary) }
+                    if !core.selected.isEmpty {Button("Обновить маршрут контакта"){core.send(["op":"get","peer":core.selected,"kind":"routes"])}}
                 }.disabled(!core.ready)
                 if !core.transfers.isEmpty {
                     Section("Файлы") {
@@ -560,24 +583,28 @@ struct RustNetworkView: View {
                 }
                 Section { if core.ready { Button("Остановить сеть", action:core.stop) } else { Button("Запустить сеть", action:core.start).disabled(core.starting) } }
             }
-                } else { conversationList }
+                } else if callsOpen { callList } else { conversationList }
             }
-            .navigationTitle(chatOpen ? selectedName : settingsOpen ? "Настройки" : "Бетельгейзе")
+            .safeAreaInset(edge:.bottom,spacing:0) { if !chatOpen { bottomNavigation } }
+            .navigationTitle(chatOpen ? selectedName : settingsOpen ? "Настройки" : callsOpen ? "Звонки" : "Бетельгейзе")
             .navigationBarTitleDisplayMode(chatOpen ? .inline : .large)
             .tint(accent)
+            .preferredColorScheme(.dark)
             .toolbar {
-                if chatOpen || settingsOpen { ToolbarItem(placement:.navigationBarLeading) { Button { chatOpen=false;settingsOpen=false } label:{ Image(systemName:"chevron.left") } } }
+                if chatOpen { ToolbarItem(placement:.navigationBarLeading) { Button { chatOpen=false;settingsOpen=false } label:{ Image(systemName:"chevron.left") } } }
                 if chatOpen { ToolbarItemGroup(placement:.navigationBarTrailing) {
                     Button { call.dial(core.selected,video:false,settings:settings) } label:{ Image(systemName:"phone.fill") }.disabled(!core.ready || call.active)
                     Button { call.dial(core.selected,video:true,settings:settings) } label:{ Image(systemName:"video.fill") }.disabled(!core.ready || call.active)
-                    Menu { Button("Обновить маршрут"){core.send(["op":"get","peer":core.selected,"kind":"routes"])}; Button("Повторить отправку"){core.send(["op":"retry","peer":core.selected])}; Button("Переданные файлы"){chatOpen=false;settingsOpen=true} } label:{Image(systemName:"ellipsis.circle")}
-                } } else if !settingsOpen { ToolbarItem(placement:.navigationBarTrailing) { Button { settingsOpen=true } label:{ Image(systemName:"gearshape.fill") } } }
+                    Menu { Button("Повторить отправку"){core.send(["op":"retry","peer":core.selected])}; Button("Переданные файлы"){chatOpen=false;settingsOpen=true} } label:{Image(systemName:"ellipsis.circle")}
+                } } else if callsOpen && !settingsOpen { ToolbarItem(placement:.navigationBarTrailing) { Button { confirmClearCalls=true } label:{ Image(systemName:"trash") }.disabled(call.history.isEmpty) } }
             }
+            .confirmationDialog("Удалить историю звонков?",isPresented:$confirmClearCalls,titleVisibility:.visible) {Button("Удалить",role:.destructive){call.clearHistory()};Button("Отмена",role:.cancel){}}
             .fileImporter(isPresented:$pickingFile,allowedContentTypes:[.item]) { result in
                 if case .success(let url)=result { core.sendFile(url,peer:core.selected) }
             }
             .onAppear {
                 visible=true
+                if !turnLoaded { loadTurnCredentials();turnLoaded=true }
                 bootstrap=customNode
                 applePair.preview={ [weak core] link,done in
                     guard let core else {done(nil,nil);return}
@@ -608,9 +635,46 @@ struct RustNetworkView: View {
         }
     }
 
+    private var bottomNavigation: some View {
+        HStack(spacing:0) {
+            tab("bubble.left.and.bubble.right.fill","Чаты",!callsOpen && !settingsOpen){callsOpen=false;settingsOpen=false}
+            tab("phone.fill","Звонки",callsOpen && !settingsOpen){callsOpen=true;settingsOpen=false}
+            tab("gearshape.fill","Настройки",settingsOpen){settingsOpen=true}
+        }.padding(.vertical,9).background(Color(red:0.12,green:0.08,blue:0.09))
+    }
+    private func tab(_ icon:String,_ caption:String,_ active:Bool,_ action:@escaping()->Void)->some View {
+        Button(action:action){VStack(spacing:5){Image(systemName:icon).font(.system(size:22));Text(caption).font(.caption)}.foregroundStyle(active ? accent : Color.gray).frame(maxWidth:.infinity)}.buttonStyle(.plain)
+    }
+    private var callList: some View {
+        ScrollView { LazyVStack(alignment:.leading,spacing:0) {
+            Text("Новый звонок").font(.headline).padding()
+            ForEach(core.contacts){contact in
+                HStack { Image(systemName:"person.crop.circle.fill").font(.title2).foregroundStyle(accent);Text(contact.name).font(.headline);Spacer()
+                    Button{call.dial(contact.id,video:false,settings:settings)}label:{Image(systemName:"phone.fill")}.disabled(!core.ready || call.active)
+                    Button{call.dial(contact.id,video:true,settings:settings)}label:{Image(systemName:"video.fill")}.disabled(!core.ready || call.active)
+                }.padding(.horizontal).padding(.vertical,12)
+                Divider().padding(.leading)
+            }
+            Text("Недавние").font(.headline).padding()
+            if call.history.isEmpty {Text("История звонков пока пуста").foregroundStyle(.secondary).padding()}
+            ForEach(call.history){item in
+                HStack(spacing:12) {
+                    Image(systemName:item.outgoing ? "arrow.up.right" : "arrow.down.left").foregroundStyle(item.seconds>0 ? accent : Color.secondary)
+                    VStack(alignment:.leading,spacing:5){
+                        Text(core.contacts.first(where:{$0.id==item.peer})?.name ?? String(item.peer.prefix(16))).font(.headline)
+                        Text((item.video ? "Видео · " : "Аудио · ")+item.result).font(.caption).foregroundStyle(.secondary)
+                        Text(item.date,style:.relative).font(.caption2).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button{call.dial(item.peer,video:item.video,settings:settings)}label:{Image(systemName:item.video ? "video.fill" : "phone.fill")}.disabled(!core.ready || call.active)
+                }.padding(.horizontal).padding(.vertical,12)
+                Divider().padding(.leading)
+            }
+        }}
+    }
     private var conversationList: some View {
         VStack(spacing:0) {
-            HStack { Circle().fill(core.ready ? Color.green : .gray).frame(width:9,height:9); Text(core.ready ? core.networkStatus : core.status).font(.caption); Spacer(); Button {settingsOpen=true} label:{Label("Добавить",systemImage:"person.badge.plus").font(.subheadline)} }.padding(.horizontal).padding(.vertical,10)
+            HStack { Circle().fill(core.ready ? Color.green : .gray).frame(width:9,height:9); Text(core.ready ? "Сеть запущена" : "Подключение…").font(.caption); Spacer(); Button {settingsOpen=true} label:{Label("Добавить",systemImage:"person.badge.plus").font(.subheadline)} }.padding(.horizontal).padding(.vertical,10)
             HStack { Image(systemName:"magnifyingglass").foregroundStyle(.secondary); TextField("Поиск контактов",text:$search) }.padding(12).background(.thinMaterial,in:RoundedRectangle(cornerRadius:14)).padding(.horizontal)
             if core.contacts.isEmpty { Spacer(); Image(systemName:"bubble.left.and.bubble.right").font(.system(size:45)).foregroundStyle(accent); Text("Нет контактов").font(.headline).padding(.top); Button("Добавить контакт"){settingsOpen=true}.padding(); Spacer() }
             else { ScrollView { LazyVStack(spacing:0) {

@@ -11,6 +11,7 @@ import android.media.AudioAttributes;
 import android.os.Handler;
 import android.os.Looper;
 import org.json.JSONObject;
+import org.json.JSONArray;
 import org.webrtc.*;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -46,6 +47,17 @@ final class RustRtc {
     private Ringtone ringtone;
     boolean speaker;
     long connectedAt;
+    JSONArray history(){try{return new JSONArray(activity.getPreferences(Activity.MODE_PRIVATE).getString("callHistory","[]"));}catch(Exception error){return new JSONArray();}}
+    void clearHistory(){activity.getPreferences(Activity.MODE_PRIVATE).edit().remove("callHistory").apply();changed();}
+    private void recordCall(String reason){
+        if(!active()||peer.isEmpty()||id.isEmpty())return;
+        try{
+            JSONArray old=history(),items=new JSONArray();long seconds=connectedAt==0?0:Math.max(0,(android.os.SystemClock.elapsedRealtime()-connectedAt)/1000);
+            items.put(new JSONObject().put("peer",peer).put("video",video).put("outgoing",initiator).put("date",System.currentTimeMillis()).put("seconds",seconds).put("result",connectedAt==0?reason:"Разговор завершён"));
+            for(int i=0;i<Math.min(99,old.length());i++)items.put(old.get(i));
+            activity.getPreferences(Activity.MODE_PRIVATE).edit().putString("callHistory",items.toString()).apply();
+        }catch(Exception ignored){}
+    }
     private void startRinging(){
         try {
             ringtone=RingtoneManager.getRingtone(activity,RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE));
@@ -313,6 +325,7 @@ final class RustRtc {
     private void fail(String reason){if(active())transmit(signal("hangup"));finish(reason);}
 
     private void finish(String reason){
+        recordCall(reason);
         stopRinging();connectedAt=0;speaker=false;
         if(deadline!=null){main.removeCallbacks(deadline);deadline=null;}
         permissionContinuation=null;id="";peer="";phase="idle";status=reason;

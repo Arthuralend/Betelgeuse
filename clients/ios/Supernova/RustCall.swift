@@ -21,6 +21,16 @@ struct CallIceSettings {
     }
 }
 
+struct RustCallLog: Identifiable, Codable {
+    let id: String
+    let peer: String
+    let video: Bool
+    let outgoing: Bool
+    let date: Date
+    let seconds: Int
+    let result: String
+}
+
 final class RustCall: NSObject, ObservableObject, RTCPeerConnectionDelegate {
     enum Phase { case idle, outgoing, incoming, connecting, connected }
     @Published private(set) var phase: Phase = .idle
@@ -49,6 +59,11 @@ final class RustCall: NSObject, ObservableObject, RTCPeerConnectionDelegate {
     private var ringtone: AVAudioPlayer?
     @Published private(set) var speaker = false
     @Published private(set) var connectedAt: Date?
+    @Published private(set) var history: [RustCallLog] = {
+        guard let data=UserDefaults.standard.data(forKey:"rust.callHistory") else { return [] }
+        return (try? JSONDecoder().decode([RustCallLog].self,from:data)) ?? []
+    }()
+    func clearHistory() { history=[]; UserDefaults.standard.removeObject(forKey:"rust.callHistory") }
 
     private func startRinging() {
         guard let url = Bundle.main.url(forResource: "ring", withExtension: "wav") else { return }
@@ -266,6 +281,12 @@ final class RustCall: NSObject, ObservableObject, RTCPeerConnectionDelegate {
     }
 
     private func finish(_ reason: String) {
+        if active && !id.isEmpty && !peer.isEmpty {
+            let duration=connectedAt.map { max(0,Int(Date().timeIntervalSince($0))) } ?? 0
+            history.insert(RustCallLog(id:id,peer:peer,video:video,outgoing:initiator,date:Date(),seconds:duration,result:connectedAt == nil ? reason : "Разговор завершён"),at:0)
+            history=Array(history.prefix(100))
+            if let data=try? JSONEncoder().encode(history) { UserDefaults.standard.set(data,forKey:"rust.callHistory") }
+        }
         stopRinging(); connectedAt = nil; speaker = false
         deadline?.cancel(); deadline = nil
         let old = connection; connection = nil; old?.close()

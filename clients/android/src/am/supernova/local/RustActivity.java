@@ -75,7 +75,9 @@ public final class RustActivity extends Activity {
     private TextView status, identity;
     private EditText name, bootstrap, inviteInput, peerInput, draft;
     private LinearLayout contacts, messages, inviteActions, chat, landing;
-    private ScrollView settingsPane, messageScroll;
+    private ScrollView settingsPane, messageScroll, callsPane;
+    private LinearLayout callsList, bottomNav;
+    private TextView navChats,navCalls,navSettings;
     private TextView chatTitle;
     private EditText contactSearch;
     private String currentFilter="";
@@ -106,7 +108,6 @@ public final class RustActivity extends Activity {
         scroll.addView(content);
         LinearLayout screen=column();screen.setBackgroundColor(0xff10111a);setContentView(screen);
         settingsPane=scroll;screen.addView(settingsPane,new LinearLayout.LayoutParams(-1,0,1));settingsPane.setVisibility(View.GONE);
-        button(content,"‹  Чаты",this::showChats);
         TextView title = label("Бетельгейзе · P2P"); title.setTextSize(25); content.addView(title);
         status = label("Запуск ядра…");content.addView(status);
         networkStatus=label("Ожидание сети");content.addView(networkStatus);
@@ -130,6 +131,7 @@ public final class RustActivity extends Activity {
         button(advancedPanel,"Сохранить дополнительный узел",()->{remember();configure();});
         button(advancedPanel,"Сбросить дополнительный узел",()->{bootstrap.setText("");remember();configure();});
         button(advancedPanel,"Обновить профиль и маршруты",()->{remember();configure();command("network_changed");});
+        button(advancedPanel,"Обновить маршрут выбранного контакта",()->{if(!chosen.isEmpty())command("get","peer",chosen,"kind","routes");});
         button(advancedPanel, "Создать приглашение", () -> {
             remember();
             qrFile = new File(getCacheDir(), "betelgeuse-" + UUID.randomUUID() + ".svg");
@@ -153,12 +155,12 @@ public final class RustActivity extends Activity {
         iceUser=input(content,"TURN логин");
         icePassword=input(content,"TURN пароль");
         icePassword.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        loadTurnCredentials();button(content,"Сохранить параметры звонков",this::saveTurnCredentials);
         filePanel=column();content.addView(filePanel);
         button(content, "Открыть совместимый режим 0.3", () -> startActivity(new Intent(this, MainActivity.class)));
         landing=column();landing.setPadding(dp(16),dp(12),dp(16),dp(12));screen.addView(landing,new LinearLayout.LayoutParams(-1,0,1));
         LinearLayout listHeader=new LinearLayout(this);listHeader.setGravity(Gravity.CENTER_VERTICAL);landing.addView(listHeader);
         TextView brand=label("Бетельгейзе");brand.setTextSize(26);brand.setTextColor(0xffffa855);listHeader.addView(brand,new LinearLayout.LayoutParams(0,-2,1));
-        button(listHeader,"Настройки",this::showSettings);
         button(landing,"＋  Добавить контакт",()->{showSettings();advancedPanel.setVisibility(View.VISIBLE);});
         contactSearch=input(landing,"Поиск контактов");
         contactSearch.addTextChangedListener(new android.text.TextWatcher(){
@@ -172,13 +174,16 @@ public final class RustActivity extends Activity {
         button(header,"‹",this::showChats);
         chatTitle=label("Переписка");chatTitle.setTextSize(20);header.addView(chatTitle,new LinearLayout.LayoutParams(0,-2,1));
         button(header,"☎",()->dial(false));button(header,"Видео",()->dial(true));
-        Button more=new Button(this);more.setText("⋯");header.addView(more);more.setOnClickListener(v->{android.widget.PopupMenu menu=new android.widget.PopupMenu(this,v);menu.getMenu().add("Обновить маршрут").setOnMenuItemClickListener(i->{command("get","peer",chosen,"kind","routes");return true;});menu.getMenu().add("Повторить отправку").setOnMenuItemClickListener(i->{command("retry","peer",chosen);return true;});menu.show();});
+        Button more=new Button(this);more.setText("⋯");header.addView(more);more.setOnClickListener(v->{android.widget.PopupMenu menu=new android.widget.PopupMenu(this,v);menu.getMenu().add("Повторить отправку").setOnMenuItemClickListener(i->{command("retry","peer",chosen);return true;});menu.show();});
         callPanel=column();chat.addView(callPanel);
         messageScroll=new ScrollView(this);messages=column();messageScroll.addView(messages);chat.addView(messageScroll,new LinearLayout.LayoutParams(-1,0,1));
         LinearLayout composer=new LinearLayout(this);composer.setGravity(Gravity.CENTER_VERTICAL);chat.addView(composer);
         button(composer,"＋",this::pickFile);
         draft=new EditText(this);draft.setTextColor(Color.WHITE);draft.setHintTextColor(0xffb4b4b4);draft.setHint("Сообщение");draft.setMaxLines(5);composer.addView(draft,new LinearLayout.LayoutParams(0,-2,1));
         button(composer,"➤",()->{if(!chosen.isEmpty()&&!str(draft).trim().isEmpty()){command("send","peer",chosen,"text",str(draft));draft.setText("");}});
+        callsPane=new ScrollView(this);callsList=column();callsList.setPadding(dp(16),dp(12),dp(16),dp(12));callsPane.addView(callsList);screen.addView(callsPane,new LinearLayout.LayoutParams(-1,0,1));callsPane.setVisibility(View.GONE);
+        bottomNav=new LinearLayout(this);bottomNav.setBackgroundColor(0xff21191b);screen.addView(bottomNav,new LinearLayout.LayoutParams(-1,dp(67)));
+        navChats=navItem("◉\nЧаты",this::showChats);navCalls=navItem("☎\nЗвонки",this::showCalls);navSettings=navItem("⚙\nНастройки",this::showSettings);markNav(navChats);
         call=new RustRtc(this,(peer,id,signal)->command("call_signal","peer",peer,"id",id,"signal",signal),this::renderCall);
         nearby=new NearbyDiscovery(this,this::renderNearby);
         startCore();
@@ -328,7 +333,7 @@ public final class RustActivity extends Activity {
                     contactNames.put(peer,label);
 
                 }
-                renderContacts();renderNearby();int counted=0;for(String contact:contactNames.keySet()){if(counted++>=30)break;command("history","peer",contact);}break;
+                renderContacts();renderCalls();renderNearby();int counted=0;for(String contact:contactNames.keySet()){if(counted++>=30)break;command("history","peer",contact);}break;
             case "queued": case "message": case "delivery":
                 String changedPeer=event.optString("peer");if(!changedPeer.isEmpty()&&!changedPeer.equals(chosen))command("history","peer",changedPeer);else refresh();break;
             case "history":
@@ -358,9 +363,12 @@ public final class RustActivity extends Activity {
         }
     }
 
-    private void showChats(){settingsPane.setVisibility(View.GONE);chat.setVisibility(View.GONE);landing.setVisibility(View.VISIBLE);}
-    private void showSettings(){landing.setVisibility(View.GONE);chat.setVisibility(View.GONE);settingsPane.setVisibility(View.VISIBLE);}
-    private void openChat(String peer){chosen=peer;chatTitle.setText(contactNames.containsKey(peer)?contactNames.get(peer):peer);landing.setVisibility(View.GONE);settingsPane.setVisibility(View.GONE);chat.setVisibility(View.VISIBLE);messages.removeAllViews();draft.setText("");refresh();}
+    private TextView navItem(String title,Runnable action){TextView v=label(title);v.setGravity(Gravity.CENTER);v.setTextSize(15);v.setOnClickListener(x->action.run());bottomNav.addView(v,new LinearLayout.LayoutParams(0,-1,1));return v;}
+    private void markNav(TextView selected){for(TextView v:new TextView[]{navChats,navCalls,navSettings})if(v!=null)v.setTextColor(v==selected?0xffffa855:0xffa8a5ad);}
+    private void showChats(){settingsPane.setVisibility(View.GONE);chat.setVisibility(View.GONE);callsPane.setVisibility(View.GONE);landing.setVisibility(View.VISIBLE);bottomNav.setVisibility(View.VISIBLE);markNav(navChats);}
+    private void showSettings(){landing.setVisibility(View.GONE);chat.setVisibility(View.GONE);callsPane.setVisibility(View.GONE);settingsPane.setVisibility(View.VISIBLE);bottomNav.setVisibility(View.VISIBLE);markNav(navSettings);}
+    private void showCalls(){landing.setVisibility(View.GONE);chat.setVisibility(View.GONE);settingsPane.setVisibility(View.GONE);callsPane.setVisibility(View.VISIBLE);bottomNav.setVisibility(View.VISIBLE);markNav(navCalls);renderCalls();}
+    private void openChat(String peer){chosen=peer;chatTitle.setText(contactNames.containsKey(peer)?contactNames.get(peer):peer);landing.setVisibility(View.GONE);settingsPane.setVisibility(View.GONE);chat.setVisibility(View.VISIBLE);callsPane.setVisibility(View.GONE);bottomNav.setVisibility(View.GONE);messages.removeAllViews();draft.setText("");refresh();}
     private void renderContacts(){
         if(contacts==null)return;contacts.removeAllViews();
         for(java.util.Map.Entry<String,String> item:contactNames.entrySet()){
@@ -374,13 +382,54 @@ public final class RustActivity extends Activity {
         }
         if(contactNames.isEmpty())contacts.addView(label("Нет контактов. Нажмите «Добавить контакт»."));
     }
-    @Override public void onBackPressed(){if(chat.getVisibility()==View.VISIBLE||settingsPane.getVisibility()==View.VISIBLE){showChats();return;}super.onBackPressed();}
+    @Override public void onBackPressed(){if(chat.getVisibility()==View.VISIBLE||settingsPane.getVisibility()==View.VISIBLE||callsPane.getVisibility()==View.VISIBLE){showChats();return;}super.onBackPressed();}
 
-    private void dial(boolean video){
-        if(call==null||chosen.isEmpty())return;
+    private void renderCalls(){
+        if(callsList==null||call==null)return;callsList.removeAllViews();
+        TextView title=label("Звонки");title.setTextSize(26);title.setTextColor(0xffffa855);callsList.addView(title);
+        callsList.addView(label("Новый звонок"));
+        for(java.util.Map.Entry<String,String> item:contactNames.entrySet()){
+            String target=item.getKey();
+            LinearLayout row=new LinearLayout(this);row.setGravity(Gravity.CENTER_VERTICAL);TextView who=label(item.getValue());who.setTextSize(17);row.addView(who,new LinearLayout.LayoutParams(0,-2,1));
+            button(row,"☎",()->dialTo(target,false));button(row,"Видео",()->dialTo(target,true));callsList.addView(row);
+        }
+        callsList.addView(label("Недавние"));
+        JSONArray history=call.history();
+        if(history.length()==0)callsList.addView(label("История звонков пока пуста"));
+        for(int i=0;i<history.length();i++){
+            JSONObject item=history.optJSONObject(i);if(item==null)continue;String target=item.optString("peer");boolean video=item.optBoolean("video");String who=contactNames.containsKey(target)?contactNames.get(target):target.substring(0,Math.min(16,target.length()));
+            LinearLayout row=new LinearLayout(this);row.setGravity(Gravity.CENTER_VERTICAL);row.setPadding(0,dp(10),0,dp(10));
+            LinearLayout details=column();TextView primary=label((item.optBoolean("outgoing")?"↗  ":"↙  ")+who);primary.setTextSize(18);details.addView(primary);
+            String date=java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.SHORT,java.text.DateFormat.SHORT).format(new java.util.Date(item.optLong("date")));
+            TextView subtitle=label((video?"Видео · ":"Аудио · ")+item.optString("result")+" · "+date);subtitle.setTextColor(0xffa8a5ad);subtitle.setTextSize(12);details.addView(subtitle);row.addView(details,new LinearLayout.LayoutParams(0,-2,1));button(row,"☎",()->dialTo(target,video));callsList.addView(row);
+        }
+        if(history.length()>0)button(callsList,"Очистить историю",()->new AlertDialog.Builder(this).setMessage("Удалить историю звонков?").setNegativeButton("Отмена",null).setPositiveButton("Удалить",(d,w)->call.clearHistory()).show());
+    }
+    private javax.crypto.SecretKey turnKey() throws Exception{
+        java.security.KeyStore ks=java.security.KeyStore.getInstance("AndroidKeyStore");ks.load(null);
+        java.security.Key existing=ks.getKey("betelgeuse-turn-v1",null);if(existing instanceof javax.crypto.SecretKey)return (javax.crypto.SecretKey)existing;
+        javax.crypto.KeyGenerator gen=javax.crypto.KeyGenerator.getInstance("AES","AndroidKeyStore");
+        gen.init(new android.security.keystore.KeyGenParameterSpec.Builder("betelgeuse-turn-v1",android.security.keystore.KeyProperties.PURPOSE_ENCRYPT|android.security.keystore.KeyProperties.PURPOSE_DECRYPT).setBlockModes(android.security.keystore.KeyProperties.BLOCK_MODE_GCM).setEncryptionPaddings(android.security.keystore.KeyProperties.ENCRYPTION_PADDING_NONE).build());return gen.generateKey();
+    }
+    private void loadTurnCredentials(){
+        try{String stored=getPreferences(MODE_PRIVATE).getString("turnCredentials","");if(stored.isEmpty())return;String[] parts=stored.split(":",2);if(parts.length!=2)return;
+            javax.crypto.Cipher c=javax.crypto.Cipher.getInstance("AES/GCM/NoPadding");c.init(javax.crypto.Cipher.DECRYPT_MODE,turnKey(),new javax.crypto.spec.GCMParameterSpec(128,android.util.Base64.decode(parts[0],android.util.Base64.NO_WRAP)));
+            JSONArray values=new JSONArray(new String(c.doFinal(android.util.Base64.decode(parts[1],android.util.Base64.NO_WRAP)),StandardCharsets.UTF_8));iceUser.setText(values.optString(0));icePassword.setText(values.optString(1));
+        }catch(Exception ignored){}
+    }
+    private void saveTurnCredentials(){
+        try{javax.crypto.Cipher c=javax.crypto.Cipher.getInstance("AES/GCM/NoPadding");c.init(javax.crypto.Cipher.ENCRYPT_MODE,turnKey());
+            byte[] encrypted=c.doFinal(new JSONArray().put(str(iceUser)).put(str(icePassword)).toString().getBytes(StandardCharsets.UTF_8));
+            getPreferences(MODE_PRIVATE).edit().putString("iceUrls",str(iceUrls)).putString("turnCredentials",android.util.Base64.encodeToString(c.getIV(),android.util.Base64.NO_WRAP)+":"+android.util.Base64.encodeToString(encrypted,android.util.Base64.NO_WRAP)).apply();
+            android.widget.Toast.makeText(this,"Параметры сохранены",android.widget.Toast.LENGTH_SHORT).show();
+        }catch(Exception e){android.widget.Toast.makeText(this,"Не удалось сохранить параметры",android.widget.Toast.LENGTH_SHORT).show();}
+    }
+    private void dial(boolean video){dialTo(chosen,video);}
+    private void dialTo(String target,boolean video){
+        if(call==null||target.isEmpty()||!ready)return;
         String urls=str(iceUrls);
         getPreferences(MODE_PRIVATE).edit().putString("iceUrls",urls).apply();
-        call.dial(chosen,video,urls,str(iceUser),str(icePassword));
+        call.dial(target,video,urls,str(iceUser),str(icePassword));
     }
 
     private void renderCall(){
@@ -388,6 +437,7 @@ public final class RustActivity extends Activity {
         callPanel.removeAllViews();
         if(!call.status.isEmpty())callPanel.addView(label(call.status));
         if(!call.active()){
+            renderCalls();
             if(callDialog!=null){callDialog.dismiss();callDialog=null;callScreen=null;}
             return;
         }
@@ -613,7 +663,7 @@ public final class RustActivity extends Activity {
     }
     private void button(LinearLayout parent, String text, Runnable action) {
         Button v = new Button(this); v.setText(text); v.setAllCaps(false);
-        v.setTextColor(0xffc4c1ff); v.setOnClickListener(view -> action.run()); parent.addView(v);
+        v.setTextColor(0xffffa855); v.setOnClickListener(view -> action.run()); parent.addView(v);
     }
 
     @Override protected void onResume(){super.onResume();foreground=true;discover();if(ready)command("network_changed");}

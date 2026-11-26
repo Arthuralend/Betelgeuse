@@ -34,4 +34,4 @@ for target in aarch64-linux-android x86_64-linux-android; do
 done
 
 BETELGEUSE_WEBRTC_AAR="$aar" BETELGEUSE_NATIVE_LIBS="$root/target/mobile-android" BETELGEUSE_UNSIGNED=1 bash clients/android/build.sh
-cp clients/android/Betelgeuse-0.8.3-Android-unsigned.apk dist/
+cp clients/android/Betelgeuse-0.8.4-Android-unsigned.apk dist/
