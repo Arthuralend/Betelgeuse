@@ -119,12 +119,14 @@ impl Node {
         let codec = request_response::cbor::codec::Codec::default()
             .set_request_size_maximum(16_384).set_response_size_maximum(1024);
         let public = key.public();
-        let swarm = SwarmBuilder::with_existing_identity(key.clone())
+        let builder = SwarmBuilder::with_existing_identity(key.clone())
             .with_tokio()
             .with_tcp(tcp::Config::default().nodelay(true), noise::Config::new, yamux::Config::default)?
-            .with_quic()
-            .with_dns()?
-            .with_relay_client(noise::Config::new, yamux::Config::default)?
+            .with_quic();
+        // Mobile sandbox resolver initialization must not prevent IP-only networking.
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        let builder = builder.with_dns().context("initialize system DNS")?;
+        let swarm = builder.with_relay_client(noise::Config::new, yamux::Config::default)?
             .with_behaviour(move |_, relay_client| Behaviour {
             kad,
             identify: identify::Behaviour::new(identify::Config::new(

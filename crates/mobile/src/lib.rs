@@ -43,13 +43,18 @@ impl BglEngine {
         let (commands, input) = mpsc::channel(64);
         let (sender, events) = mpsc::channel(128);
         let actor = thread::Builder::new().name("betelgeuse-core".into()).spawn(move || {
-            let outcome = (|| -> Result<()> {
+            let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<()> {
                 let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
                 let store = Store::open(&directory)?;
                 runtime.block_on(network::run(key, store, config, input, sender.clone()))
-            })();
-            if let Err(error) = outcome {
-                let _ = sender.try_send(json!({"event":"fatal","error":error.to_string()}));
+            }));
+            let error = match outcome {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(format!("{error:#}")),
+                Err(_) => Some("Native network actor panicked".into()),
+            };
+            if let Some(error) = error {
+                let _ = sender.try_send(json!({"event":"fatal","error":error}));
             }
         })?;
         Ok(Self { commands: Some(commands), events: Mutex::new(events), actor: Some(actor) })

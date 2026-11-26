@@ -57,7 +57,9 @@ final class RustNetwork: ObservableObject {
     }
 
     func start() {
-        guard engine == nil else { return }
+        guard !ready else { return }
+        if engine != nil { stop() }
+        status = "Запуск ядра…"
         do {
             let secret = try Self.loadIdentity()
             let directory = URL.applicationSupportDirectory.appendingPathComponent("BetelgeuseRust", isDirectory: true)
@@ -224,8 +226,12 @@ final class RustNetwork: ObservableObject {
                 status = "Ретранслятор доступен"
             case "connection_error", "error", "fatal":
                 status = event["error"] as? String ?? "Ошибка сети"
-                if event["event"] as? String == "fatal" { onStop?() }
-                if event["event"] as? String == "fatal" { ready = false }
+                if event["event"] as? String == "fatal" {
+                    let failure = status
+                    stop()
+                    status = failure
+                    return
+                }
             case "invite":
                 invitation = event["link"] as? String ?? ""
             case "contact":

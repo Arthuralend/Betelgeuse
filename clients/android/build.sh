@@ -14,7 +14,7 @@ unzip -q -o "$BETELGEUSE_WEBRTC_AAR" -d build/webrtc
 test -f build/webrtc/classes.jar
 "$tools/aapt2" compile --dir res -o build/resources.zip
 "$tools/aapt2" link -o build/base.apk -I "$platform" --manifest AndroidManifest.xml \
-  --java build/generated --min-sdk-version 29 --target-sdk-version 34 --version-code 7 --version-name 0.7.0 build/resources.zip
+  --java build/generated --min-sdk-version 29 --target-sdk-version 34 --version-code 8 --version-name 0.7.1 build/resources.zip
 find src build/generated -name '*.java' > build/sources.txt
 javac --release 11 -classpath "$platform:build/webrtc/classes.jar" -d build/classes @build/sources.txt
 find build/classes -name '*.class' > build/classes.txt
@@ -34,7 +34,7 @@ cp ../../docs/WEBRTC-LICENSE.txt build/notices/assets/WebRTC-LICENSE.txt
 "$tools/zipalign" -f 4 build/unsigned.apk build/aligned.apk
 
 if [[ "${BETELGEUSE_UNSIGNED:-0}" == 1 ]]; then
-  cp build/aligned.apk Betelgeuse-0.7.0-Android-unsigned.apk
+  cp build/aligned.apk Betelgeuse-0.7.1-Android-unsigned.apk
   exit 0
 fi
 
@@ -49,5 +49,5 @@ if [[ ! -f "$keystore" ]]; then
     -alias betelgeuse -keyalg RSA -keysize 3072 -validity 10000 -dname 'CN=Betelgeuse Beta')
 fi
 "$tools/apksigner" sign --ks "$keystore" --ks-key-alias betelgeuse --ks-pass "file:$passfile" \
-  --v4-signing-enabled false --out Betelgeuse-0.7.0-Android.apk build/aligned.apk
-"$tools/apksigner" verify --verbose Betelgeuse-0.7.0-Android.apk
+  --v4-signing-enabled false --out Betelgeuse-0.7.1-Android.apk build/aligned.apk
+"$tools/apksigner" verify --verbose Betelgeuse-0.7.1-Android.apk
