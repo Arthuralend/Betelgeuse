@@ -110,7 +110,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: betelgeuse-ios
-          path: dist/Betelgeuse-0.8.1-iPhone-unsigned.ipa
+          path: dist/Betelgeuse-0.8.2-iPhone-unsigned.ipa
           if-no-files-found: error
 
   android:
@@ -139,7 +139,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: betelgeuse-android
-          path: dist/Betelgeuse-0.8.1-Android-unsigned.apk
+          path: dist/Betelgeuse-0.8.2-Android-unsigned.apk
           if-no-files-found: error
 
   media:

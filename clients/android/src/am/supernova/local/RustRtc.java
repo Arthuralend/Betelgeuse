@@ -5,6 +5,9 @@ import android.app.Activity;
 import android.content.Context;
 import android.content.pm.PackageManager;
 import android.media.AudioManager;
+import android.media.Ringtone;
+import android.media.RingtoneManager;
+import android.media.AudioAttributes;
 import android.os.Handler;
 import android.os.Looper;
 import org.json.JSONObject;
@@ -40,6 +43,17 @@ final class RustRtc {
     private boolean oldSpeaker, audioConfigured, localDescriptionSent, remoteDescriptionSet;
     private final List<IceCandidate> localIce=new ArrayList<>(),remoteIce=new ArrayList<>();
     private Runnable deadline,permissionContinuation;
+    private Ringtone ringtone;
+    boolean speaker;
+    long connectedAt;
+    private void startRinging(){
+        try {
+            ringtone=RingtoneManager.getRingtone(activity,RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE));
+            if(ringtone!=null){ringtone.setAudioAttributes(new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE).build());ringtone.setLooping(true);ringtone.play();}
+        }catch(RuntimeException ignored){}
+    }
+    private void stopRinging(){if(ringtone!=null){ringtone.stop();ringtone=null;}}
+    void toggleSpeaker(){if(!phase.equals("connected")||audioManager==null)return;speaker=!speaker;audioManager.setSpeakerphoneOn(speaker);changed();}
 
     RustRtc(Activity activity,Sender sender,Runnable changed) {
         this.activity=activity;this.sender=sender;this.changed=changed;
@@ -79,7 +93,7 @@ final class RustRtc {
             }
             peer=from;id=call;video=value.optBoolean("video");initiator=false;
             iceUrls=urls;iceUser=username;icePassword=password;phase="incoming";
-            status=video?"Входящий видеозвонок":"Входящий аудиозвонок";changed();timeout(45);
+            status=video?"Входящий видеозвонок":"Входящий аудиозвонок";startRinging();changed();timeout(45);
             return;
         }
         if(!active()||!peer.equals(from)||!id.equals(call))return;
@@ -109,6 +123,7 @@ final class RustRtc {
 
     void answer(){
         if(!phase.equals("incoming"))return;
+        stopRinging();
         phase="connecting";status="Подключение…";changed();timeout(60);
         requireMedia(()->{if(!transmit(signal("accept")))finish("Не удалось ответить");});
     }
@@ -124,7 +139,7 @@ final class RustRtc {
         if(deadline!=null)main.removeCallbacks(deadline);
         String expected=id;
         deadline=()->{if(active()&&id.equals(expected)&&!phase.equals("connected")){
-            transmit(signal("hangup"));finish("Время ожидания истекло");
+            transmit(signal("hangup"));finish(phase.equals("connecting")?"Не удалось установить медиасоединение. Проверьте STUN/TURN.":"Время ожидания истекло");
         }};
         main.postDelayed(deadline,seconds*1000L);
     }
@@ -170,7 +185,7 @@ final class RustRtc {
             }
             audioManager=(AudioManager)activity.getSystemService(Context.AUDIO_SERVICE);
             previousMode=audioManager.getMode();oldSpeaker=audioManager.isSpeakerphoneOn();audioConfigured=true;
-            audioManager.setMode(AudioManager.MODE_IN_COMMUNICATION);audioManager.setSpeakerphoneOn(true);
+            audioManager.setMode(AudioManager.MODE_IN_COMMUNICATION);speaker=video;audioManager.setSpeakerphoneOn(speaker);
             egl=EglBase.create();
             factory=PeerConnectionFactory.builder()
                 .setVideoEncoderFactory(new DefaultVideoEncoderFactory(egl.getEglBaseContext(),true,true))
@@ -185,7 +200,8 @@ final class RustRtc {
                         switch(state){
                             case CONNECTED:case COMPLETED:
                                 if(deadline!=null)main.removeCallbacks(deadline);
-                                phase="connected";status="WebRTC-соединение";changed();break;
+                                phase="connected";status="Соединение установлено";if(connectedAt==0)connectedAt=android.os.SystemClock.elapsedRealtime();changed();break;
+                            case CHECKING:status="Поиск голосового маршрута…";changed();break;
                             case FAILED:fail("WebRTC: соединение не установлено. Проверьте ICE/TURN.");break;
                             case DISCONNECTED:phase="connecting";status="Восстановление соединения…";changed();timeout(30);break;
                             default:break;
@@ -297,6 +313,7 @@ final class RustRtc {
     private void fail(String reason){if(active())transmit(signal("hangup"));finish(reason);}
 
     private void finish(String reason){
+        stopRinging();connectedAt=0;speaker=false;
         if(deadline!=null){main.removeCallbacks(deadline);deadline=null;}
         permissionContinuation=null;id="";peer="";phase="idle";status=reason;
         if(capturer!=null){try{capturer.stopCapture();}catch(Exception ignored){}capturer.dispose();capturer=null;}
