@@ -46,6 +46,27 @@ final class RustCall: NSObject, ObservableObject, RTCPeerConnectionDelegate {
     private var localDescriptionSent = false
     private var remoteDescriptionSet = false
     private var deadline: DispatchWorkItem?
+    private var ringtone: AVAudioPlayer?
+    @Published private(set) var speaker = false
+    @Published private(set) var connectedAt: Date?
+
+    private func startRinging() {
+        guard let url = Bundle.main.url(forResource: "ring", withExtension: "wav") else { return }
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(.ambient, mode: .default)
+            try session.setActive(true)
+            let player = try AVAudioPlayer(contentsOf: url)
+            player.numberOfLoops = -1
+            ringtone = player
+            player.play()
+        } catch { /* The incoming screen remains available if audio is unavailable. */ }
+    }
+    private func stopRinging() { ringtone?.stop(); ringtone = nil }
+    func toggleSpeaker() {
+        guard phase == .connected else { return }
+        do { try AVAudioSession.sharedInstance().overrideOutputAudioPort(speaker ? .none : .speaker); speaker.toggle() } catch {}
+    }
 
     var active: Bool { phase != .idle }
 
@@ -77,6 +98,7 @@ final class RustCall: NSObject, ObservableObject, RTCPeerConnectionDelegate {
             peer = from; id = callID; video = signal["video"] as? Bool ?? false
             iceSettings = settings; initiator = false; phase = .incoming
             status = video ? "Входящий видеозвонок" : "Входящий аудиозвонок"
+            startRinging()
             scheduleTimeout(45)
             return
         }
@@ -104,6 +126,7 @@ final class RustCall: NSObject, ObservableObject, RTCPeerConnectionDelegate {
 
     func answer() {
         guard phase == .incoming else { return }
+        stopRinging()
         phase = .connecting; status = "Подключение…"; scheduleTimeout(60)
         setup { [weak self] ok in
             guard let self, ok else { return }
@@ -130,7 +153,7 @@ final class RustCall: NSObject, ObservableObject, RTCPeerConnectionDelegate {
         let timer = DispatchWorkItem { [weak self] in
             guard let self, self.id == expected, self.phase != .connected else { return }
             _ = self.transmit(["kind":"hangup"])
-            self.finish("Время ожидания истекло")
+            self.finish(self.phase == .connecting ? "Не удалось установить медиасоединение. Проверьте STUN/TURN." : "Время ожидания истекло")
         }
         deadline = timer; DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: timer)
     }
@@ -148,8 +171,10 @@ final class RustCall: NSObject, ObservableObject, RTCPeerConnectionDelegate {
             do {
                 let audio = AVAudioSession.sharedInstance()
                 try audio.setCategory(.playAndRecord, mode: withVideo ? .videoChat : .voiceChat,
-                                      options:[.defaultToSpeaker,.allowBluetooth])
+                                      options:[.allowBluetooth])
+                self.speaker = withVideo
                 try audio.setActive(true)
+                if withVideo { try audio.overrideOutputAudioPort(.speaker) }
                 let config = RTCConfiguration()
                 config.sdpSemantics = .unifiedPlan
                 config.iceServers = try self.iceSettings.servers()
@@ -241,6 +266,7 @@ final class RustCall: NSObject, ObservableObject, RTCPeerConnectionDelegate {
     }
 
     private func finish(_ reason: String) {
+        stopRinging(); connectedAt = nil; speaker = false
         deadline?.cancel(); deadline = nil
         let old = connection; connection = nil; old?.close()
         camera?.stopCapture(); camera = nil
@@ -266,7 +292,9 @@ final class RustCall: NSObject, ObservableObject, RTCPeerConnectionDelegate {
             guard let self, let pc, self.connection === pc else { return }
             switch newState {
             case .connected, .completed:
-                self.deadline?.cancel(); self.phase = .connected; self.status = "WebRTC-соединение"
+                self.deadline?.cancel(); self.phase = .connected; self.status = "Соединение установлено"
+                if self.connectedAt == nil { self.connectedAt = Date() }
+            case .checking: self.status = "Поиск голосового маршрута…"
             case .failed: self.fail(self.id,"WebRTC: соединение не установлено. Проверьте ICE/TURN.")
             case .disconnected:
                 self.phase = .connecting; self.status = "Восстановление соединения…"; self.scheduleTimeout(30)
@@ -311,4 +339,57 @@ struct RustVideo: UIViewRepresentable {
         }
     }
     static func dismantleUIView(_ view: RTCMTLVideoView, coordinator: Coordinator) { coordinator.current?.remove(view) }
+}
+
+
+struct RustCallScreen: View {
+    @ObservedObject var call: RustCall
+    let name: String
+    private var incoming: Bool { call.phase == .incoming }
+    private var connected: Bool { call.phase == .connected }
+    var body: some View {
+        ZStack {
+            LinearGradient(colors: [Color(red: 0.20, green: 0.09, blue: 0.12), .black], startPoint: .top, endPoint: .bottom).ignoresSafeArea()
+            if let track = call.remoteVideo { RustVideo(track: track).ignoresSafeArea() }
+            VStack(spacing: 18) {
+                Text("БЕТЕЛЬГЕЙЗЕ").font(.caption.weight(.semibold)).tracking(4).foregroundStyle(.orange)
+                Spacer(minLength: 12)
+                if call.remoteVideo == nil {
+                    ZStack {
+                        Circle().fill(.orange.opacity(0.13)).frame(width: 140, height: 140)
+                        Circle().strokeBorder(.orange.opacity(0.5), lineWidth: 2).frame(width: 114, height: 114)
+                        Image(systemName: call.video ? "video.fill" : "person.crop.circle.fill").font(.system(size: 55)).foregroundStyle(.orange)
+                    }
+                }
+                Text(name).font(.largeTitle.bold()).multilineTextAlignment(.center).lineLimit(2)
+                Text(call.status).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                if connected, let start = call.connectedAt { Text(start, style: .timer).monospacedDigit() }
+                if let track = call.localVideo { RustVideo(track: track).frame(width: 110, height: 150).clipShape(RoundedRectangle(cornerRadius: 16)) }
+                Spacer(minLength: 12)
+                if incoming {
+                    HStack(spacing: 48) {
+                        control("phone.down.fill", "Отклонить", .red, call.hangup)
+                        control("phone.fill", "Ответить", .green, call.answer)
+                    }
+                } else {
+                    if call.phase == .connected || call.phase == .connecting {
+                        HStack(spacing: 20) {
+                            control(call.muted ? "mic.slash.fill" : "mic.fill", "Микрофон", .gray, call.toggleMute)
+                            if connected { control(call.speaker ? "speaker.wave.2.fill" : "speaker.fill", "Динамик", .gray, call.toggleSpeaker) }
+                            if call.video { control(call.cameraDisabled ? "video.slash.fill" : "video.fill", "Камера", .gray, call.toggleCamera) }
+                        }
+                    }
+                    control("phone.down.fill", "Завершить", .red, call.hangup)
+                }
+            }.padding(28).foregroundStyle(.white)
+        }.preferredColorScheme(.dark).interactiveDismissDisabled()
+    }
+    private func control(_ icon: String, _ title: String, _ color: Color, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(spacing: 9) {
+                Image(systemName: icon).font(.system(size: 27, weight: .semibold)).frame(width: 66, height: 66).background(color, in: Circle())
+                Text(title).font(.caption)
+            }.foregroundStyle(.white)
+        }.buttonStyle(.plain)
+    }
 }

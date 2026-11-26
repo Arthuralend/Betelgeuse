@@ -1,6 +1,11 @@
 package am.supernova.local;
 
 import android.app.Activity;
+import android.app.Dialog;
+import android.graphics.drawable.GradientDrawable;
+import android.view.Gravity;
+import android.view.ViewGroup;
+import android.widget.Chronometer;
 import android.app.AlertDialog;
 import android.content.ClipData;
 import android.content.ClipboardManager;
@@ -56,6 +61,9 @@ public final class RustActivity extends Activity {
     private String lanAddress="";
     private boolean loadingPreferences;
     private RustRtc call;
+    private Dialog callDialog;
+    private LinearLayout callScreen;
+    private final LinkedHashMap<String,String> contactNames=new LinkedHashMap<>();
     private EditText iceUrls,iceUser,icePassword;
     private LinearLayout callPanel, filePanel;
     private final LinkedHashMap<String,JSONObject> files=new LinkedHashMap<>();
@@ -295,13 +303,14 @@ public final class RustActivity extends Activity {
             case "contact":
                 inviteInput.setText(""); command("contacts"); break;
             case "contacts":
-                contacts.removeAllViews(); knownContacts.clear();
+                contacts.removeAllViews(); knownContacts.clear();contactNames.clear();
                 JSONArray list = event.optJSONArray("contacts");
                 if (list != null) for (int i = 0; i < list.length(); i++) {
                     JSONObject item = list.optJSONObject(i);
                     if (item == null) continue;
                     String peer = item.optString("peer");knownContacts.add(peer);
                     String label = item.isNull("name") ? peer.substring(0, Math.min(12, peer.length())) : item.optString("name");
+                    contactNames.put(peer,label);
                     button(contacts, label, () -> { chosen = peer; chat.setVisibility(View.VISIBLE); messages.removeAllViews(); refresh(); });
                 }
                 renderNearby();break;
@@ -343,17 +352,66 @@ public final class RustActivity extends Activity {
         if(callPanel==null||call==null)return;
         callPanel.removeAllViews();
         if(!call.status.isEmpty())callPanel.addView(label(call.status));
-        if(!call.active())return;
-        String who=call.peer;
-        callPanel.addView(label(who.length()>18?who.substring(0,18)+"…":who));
-        if(call.phase.equals("incoming"))button(callPanel,"Ответить",call::answer);
-        if(call.remoteView!=null)callPanel.addView(call.remoteView,new LinearLayout.LayoutParams(-1,dp(230)));
-        if(call.localView!=null)callPanel.addView(call.localView,new LinearLayout.LayoutParams(-1,dp(130)));
-        if(call.phase.equals("connected")||call.phase.equals("connecting")){
-            button(callPanel,call.muted?"Включить микрофон":"Выключить микрофон",call::toggleMute);
-            if(call.video)button(callPanel,call.cameraDisabled?"Включить камеру":"Выключить камеру",call::toggleCamera);
+        if(!call.active()){
+            if(callDialog!=null){callDialog.dismiss();callDialog=null;callScreen=null;}
+            return;
         }
-        button(callPanel,call.phase.equals("incoming")?"Отклонить":"Завершить",call::hangup);
+        if(isFinishing()||isDestroyed())return;
+        if(callDialog==null){
+            callDialog=new Dialog(this,android.R.style.Theme_Material_NoActionBar_Fullscreen);
+            callDialog.setCancelable(false);
+            callScreen=column();callScreen.setPadding(dp(20),dp(24),dp(20),dp(24));
+            callScreen.setGravity(Gravity.CENTER_HORIZONTAL);
+            callScreen.setBackground(new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,new int[]{0xff361820,0xff09080c}));
+            callDialog.setContentView(callScreen);
+            callDialog.show();
+            if(callDialog.getWindow()!=null)callDialog.getWindow().setLayout(-1,-1);
+        }
+        callScreen.removeAllViews();
+        callScreen.addView(callText("БЕТЕЛЬГЕЙЗЕ",17,0xffffa855));
+        View top=new View(this);callScreen.addView(top,new LinearLayout.LayoutParams(1,0,1));
+        String who=contactNames.get(call.peer);
+        if(who==null||who.isEmpty())who=call.peer.substring(0,Math.min(16,call.peer.length()));
+        if(call.remoteView==null){
+            TextView avatar=callText(call.video?"◉":"✦",52,0xffffa855);
+            GradientDrawable bg=new GradientDrawable();bg.setColor(0xff3f2424);bg.setShape(GradientDrawable.OVAL);bg.setStroke(dp(2),0xffd7833c);avatar.setBackground(bg);
+            callScreen.addView(avatar,new LinearLayout.LayoutParams(dp(116),dp(116)));
+        }
+        callScreen.addView(callText(who,29,Color.WHITE));
+        callScreen.addView(callText(call.status,16,0xffc9c4cb));
+        if(call.connectedAt>0&&call.phase.equals("connected")){
+            Chronometer timer=new Chronometer(this);timer.setBase(call.connectedAt);timer.setTextColor(Color.WHITE);timer.setGravity(Gravity.CENTER);timer.start();callScreen.addView(timer);
+        }
+        if(call.remoteView!=null)attachCallVideo(call.remoteView,dp(220));
+        if(call.localView!=null)attachCallVideo(call.localView,dp(110));
+        View bottom=new View(this);callScreen.addView(bottom,new LinearLayout.LayoutParams(1,0,1));
+        LinearLayout actions=new LinearLayout(this);actions.setGravity(Gravity.CENTER);callScreen.addView(actions);
+        if(call.phase.equals("incoming")){
+            callAction(actions,"Отклонить",0xffbd3640,call::hangup);
+            callAction(actions,"Ответить",0xff18834d,call::answer);
+        }else{
+            if(call.phase.equals("connected")||call.phase.equals("connecting")){
+                callAction(actions,call.muted?"Микр. выкл.":"Микрофон",0xff444047,call::toggleMute);
+                if(call.phase.equals("connected"))callAction(actions,call.speaker?"Динамик вкл.":"Динамик",0xff444047,call::toggleSpeaker);
+                if(call.video)callAction(actions,call.cameraDisabled?"Камера выкл.":"Камера",0xff444047,call::toggleCamera);
+            }
+            LinearLayout end=new LinearLayout(this);end.setGravity(Gravity.CENTER);callScreen.addView(end);
+            callAction(end,"Завершить",0xffbd3640,call::hangup);
+        }
+    }
+
+    private TextView callText(String value,int size,int color){
+        TextView v=new TextView(this);v.setText(value);v.setTextSize(size);v.setTextColor(color);v.setGravity(Gravity.CENTER);v.setPadding(dp(4),dp(8),dp(4),dp(8));return v;
+    }
+    private void attachCallVideo(View v,int height){
+        if(v.getParent() instanceof ViewGroup)((ViewGroup)v.getParent()).removeView(v);
+        callScreen.addView(v,new LinearLayout.LayoutParams(-1,height));
+    }
+    private void callAction(LinearLayout row,String title,int color,Runnable action){
+        Button b=new Button(this);b.setText(title);b.setAllCaps(false);b.setTextColor(Color.WHITE);b.setTextSize(13);
+        GradientDrawable bg=new GradientDrawable();bg.setColor(color);bg.setCornerRadius(dp(26));b.setBackground(bg);
+        LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(0,dp(58),1);lp.setMargins(dp(4),dp(8),dp(4),dp(8));row.addView(b,lp);b.setOnClickListener(v->action.run());
+        row.getLayoutParams().width=-1;
     }
 
     @Override public void onRequestPermissionsResult(int request,String[] permissions,int[] results){

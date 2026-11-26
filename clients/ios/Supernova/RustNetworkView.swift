@@ -519,18 +519,7 @@ struct RustNetworkView: View {
                     TextField("TURN логин",text:$turnUser).textInputAutocapitalization(.never)
                     SecureField("TURN пароль",text:$turnPassword)
                     if !call.status.isEmpty { Text(call.status).foregroundStyle(.secondary) }
-                    if call.active {
-                        if call.phase == .incoming { Button("Ответить",action:call.answer) }
-                        if let remote=call.remoteVideo { RustVideo(track:remote).frame(height:260).background(.black) }
-                        if let local=call.localVideo { RustVideo(track:local).frame(height:120).background(.black) }
-                        if call.phase == .connected || call.phase == .connecting {
-                            HStack {
-                                Button(call.muted ? "Включить микрофон" : "Выключить микрофон",action:call.toggleMute)
-                                if call.video { Button(call.cameraDisabled ? "Включить камеру" : "Выключить камеру",action:call.toggleCamera) }
-                            }.buttonStyle(.borderless)
-                        }
-                        Button(call.phase == .incoming ? "Отклонить" : "Завершить",role:.destructive,action:call.hangup)
-                    } else if !core.selected.isEmpty {
+                    if !call.active && !core.selected.isEmpty {
                         HStack {
                             Button("Аудиозвонок") { call.dial(core.selected,video:false,settings:settings) }
                             Button("Видеозвонок") { call.dial(core.selected,video:true,settings:settings) }
@@ -607,7 +596,10 @@ struct RustNetworkView: View {
                 core.start();monitor()
                 if core.ready {configure();discover()}
             }
-            .onDisappear {visible=false;call.hangup();nearby.stop();applePair.stop();networkMonitor?.cancel();networkMonitor=nil}
+            .fullScreenCover(isPresented: Binding(get: { call.active }, set: { _ in })) {
+                RustCallScreen(call: call, name: core.contacts.first(where: { $0.id == call.peer })?.name ?? String(call.peer.prefix(16)))
+            }
+            .onDisappear {guard !call.active else { return };visible=false;nearby.stop();applePair.stop();networkMonitor?.cancel();networkMonitor=nil}
             .onChange(of:core.ready){if $0{configure();discover()}}
             .onChange(of:core.tcpPort){_ in discover()}
             .onChange(of:autoNetwork){_ in configure()}
