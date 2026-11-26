@@ -107,7 +107,8 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: betelgeuse-ios
-          path: dist/Betelgeuse-0.6.0-iPhone-unsigned.ipa
+          path: dist/Betelgeuse-0.7.0-iPhone-unsigned.ipa
+          if-no-files-found: error
 
   android:
     if: github.ref == 'refs/heads/main'
@@ -135,4 +136,22 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: betelgeuse-android
-          path: dist/Betelgeuse-0.6.0-Android-unsigned.apk
+          path: dist/Betelgeuse-0.7.0-Android-unsigned.apk
+          if-no-files-found: error
+
+  media:
+    name: WebRTC synthetic media acceptance
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: betelgeuse-cli-linux
+          path: linux-ci
+      - name: Test bidirectional decoded video and received audio
+        run: |
+          chmod +x linux-ci/target/release/betelgeuse
+          google-chrome --version
+          python3 tests/webrtc_media.py --binary linux-ci/target/release/betelgeuse
