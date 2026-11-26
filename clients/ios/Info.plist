@@ -42,13 +42,13 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.6.0</string>
+	<string>0.7.0</string>
 	<key>CFBundleSupportedPlatforms</key>
 	<array>
 		<string>iPhoneOS</string>
 	</array>
 	<key>CFBundleVersion</key>
-	<string>6</string>
+	<string>7</string>
 	<key>DTPlatformName</key>
 	<string>iphoneos</string>
 	<key>LSApplicationCategoryType</key>
@@ -64,10 +64,12 @@
 		<string>_supernova._tcp</string>
 		<string>_supernova._udp</string>
 	</array>
+	<key>NSCameraUsageDescription</key>
+	<string>Betelgeuse uses the camera during video calls that you initiate or accept.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Betelgeuse connects to other devices over the local network and the Internet.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Микрофон нужен для локальных аудиозвонков Supernova. Звук не передаётся на сервер.</string>
+	<string>Betelgeuse uses the microphone during calls that you initiate or accept.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

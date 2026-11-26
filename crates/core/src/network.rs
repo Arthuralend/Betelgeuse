@@ -319,6 +319,7 @@ impl Node {
                     match (&request,response) {
                         (Exchange::FilePull { offset,.. },ExchangeReply::Chunk { id:received_id,offset:received_offset,data })
                             if received_id==id && received_offset==*offset => {
+                                if !self.transfers.has_incoming(peer,&id) { return Ok(()); }
                                 match self.transfers.chunk(peer,id.clone(),received_offset,data) {
                                     Ok((next,event)) => {
                                         if event["event"]=="file_progress" {
@@ -413,23 +414,37 @@ impl Node {
                 let peer:PeerId=peer.parse()?;
                 ensure!(uuid::Uuid::parse_str(&id)?.to_string()==id,"invalid call id");
                 signal.validate()?;
-                self.prepare_exchange(peer)?;
-                self.exchange(peer,Exchange::Signal{id,signal})?;
+                if let Err(error)=self.prepare_exchange(peer).and_then(|_|self.exchange(peer,Exchange::Signal{id:id.clone(),signal:signal.clone()})) {
+                    self.emit(json!({"event":"call_delivery","peer":peer.to_string(),"id":id,"signal":signal,"ok":false,"error":error.to_string()})).await?;
+                }
             }
             Command::Files => self.emit(json!({"event":"files","files":self.transfers.received()?})).await?,
             Command::FileSend { peer,path,name } => {
                 let peer:PeerId=peer.parse()?;
-                self.prepare_exchange(peer)?;
-                let prepared=tokio::task::spawn_blocking(move || Transfers::prepare(path.into(),name)).await??;
-                let (request,event)=self.transfers.offer(peer,prepared)?;
-                self.exchange(peer,request)?;
-                self.emit(event).await?;
+                let result:Result<()> = async {
+                    self.prepare_exchange(peer)?;
+                    let prepared=tokio::task::spawn_blocking(move || Transfers::prepare(path.into(),name)).await??;
+                    let (request,event)=self.transfers.offer(peer,prepared)?;
+                    self.exchange(peer,request)?;
+                    self.emit(event).await?;
+                    Ok(())
+                }.await;
+                if let Err(error)=result {
+                    self.emit(json!({"event":"file_prepare_failed","peer":peer.to_string(),"error":error.to_string()})).await?;
+                }
             }
             Command::FileAccept { peer,id } => {
                 let peer:PeerId=peer.parse()?;
-                self.prepare_exchange(peer)?;
-                let request=self.transfers.accept(peer,id)?;
-                self.exchange(peer,request)?;
+                let result:Result<()> = (|| {
+                    self.prepare_exchange(peer)?;
+                    let request=self.transfers.accept(peer,id.clone())?;
+                    self.exchange(peer,request)?;
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => self.emit(json!({"event":"file_started","peer":peer.to_string(),"id":id})).await?,
+                    Err(error) => self.emit(json!({"event":"file_action_failed","peer":peer.to_string(),"id":id,"error":error.to_string()})).await?,
+                }
             }
             Command::FilePause { peer,id } => {
                 let peer:PeerId=peer.parse()?;
@@ -438,9 +453,16 @@ impl Node {
             }
             Command::FileResume { peer,id } => {
                 let peer:PeerId=peer.parse()?;
-                self.prepare_exchange(peer)?;
-                let request=self.transfers.resume(peer,id)?;
-                self.exchange(peer,request)?;
+                let result:Result<()> = (|| {
+                    self.prepare_exchange(peer)?;
+                    let request=self.transfers.resume(peer,id.clone())?;
+                    self.exchange(peer,request)?;
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => self.emit(json!({"event":"file_started","peer":peer.to_string(),"id":id})).await?,
+                    Err(error) => self.emit(json!({"event":"file_action_failed","peer":peer.to_string(),"id":id,"error":error.to_string()})).await?,
+                }
             }
             Command::FileCancel { peer,id } => {
                 let peer:PeerId=peer.parse()?;

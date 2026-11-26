@@ -270,6 +270,8 @@ impl Transfers {
         }
     }
 
+    pub fn has_incoming(&self, peer: PeerId, id: &str) -> bool { self.incoming.contains_key(&(peer,id.to_owned())) }
+
     pub fn cancel(&mut self, peer: PeerId, id: &str) {
         self.incoming.remove(&(peer,id.to_owned()));
         self.outgoing.remove(&(peer,id.to_owned()));

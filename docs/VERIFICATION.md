@@ -1,35 +1,21 @@
-# Verification: Betelgeuse 0.6.0
+# Verification: Betelgeuse 0.7.0
 
-All four jobs in the final build completed successfully:
-[GitHub Actions run 6](https://github.com/Arthuralend/Betelgeuse/actions/runs/45786601051).
+The 0.6.0 baseline passed all four jobs in
+[run 6](https://github.com/Arthuralend/Betelgeuse/actions/runs/45786601051).
+The initial 0.7.0 core passed Linux and macOS jobs in
+[run 7](https://github.com/Arthuralend/Betelgeuse/actions/runs/45799194602),
+including the new two-node and relay exchange test.
 
-| Check | Result |
+| Check | Status |
 |---|---|
-| Linux Cargo unit tests and release CLI | PASS |
-| macOS ARM64 CLI and two-node integration | PASS |
-| Persistent Ed25519 identity, verification of public key and signature, expiration and rollback checks | PASS (unit / integration tests) |
-| Real DHT PUT/GET across two independent processes, QR decoding and message ACK | PASS |
-| Real Circuit Relay v2 reservation and message ACK across three processes | PASS |
-| Native Rust engine start/status/shutdown | PASS |
-| Android ARM64 and x86_64 JNI libraries and APK | Build PASS |
-| iOS ARM64 IPA and device/simulator ARM64 XCFramework | Build PASS |
+| Cargo unit tests, CLI, DHT PUT/GET, QR, text ACK, Circuit Relay v2 | PASS (run 7) |
+| File offer/accept, chunk transfer with SHA-256, authenticated signaling | PASS (run 7) |
+| Final 0.7.0 mobile builds | See latest GitHub Actions run |
+| Actual WebRTC audio/video with physical iPhone and Android on different mobile networks | Not yet tested |
 
-The Linux job actually decodes the generated SVG QR with zbar, and the
-two-node test restarts a node before retrieving a record from its peer.
-The relay test confirms a relayed connection and message acknowledgement.
-The committed Cargo.lock was extracted from the successful Linux build.
+The core integration test exercises actual independent libp2p nodes with
+synthetic data. It is not an audio/video media test and does not simulate all
+cellular NAT/CGNAT behavior. No mandatory WebRTC server is configured.
 
-The Android APK was signed locally with the existing application signing key;
-the certificate matches 0.3.0. The iPhone IPA was signed locally with a valid
-development certificate and provisioning profile. Both local signatures were
-checked successfully. Private signing material is never committed.
-
-The platform binaries have not been installed and exercised end-to-end on
-physical phones in different networks. Two-peer TCP and relay behavior was
-tested with real CLI processes; successful DCUtR traversals on arbitrary
-mobile CGNAT networks, WebRTC/Opus, file and video transport over the new Rust
-mode, automatic DHT republishing, mobile QR camera scanning and 0.3.0 identity
-migration remain to be verified or implemented. The old compatible mode is
-retained to preserve existing local data.
-
-See [QUICKSTART-RU.md](QUICKSTART-RU.md).
+GitHub produces unsigned mobile artifacts; do not store signing keys in the
+repository. See [QUICKSTART-RU.md](QUICKSTART-RU.md) for physical testing.

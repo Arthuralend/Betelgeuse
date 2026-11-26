@@ -2,6 +2,7 @@ import SwiftUI
 import Security
 import CoreImage.CIFilterBuiltins
 import BetelgeuseCore
+import UniformTypeIdentifiers
 
 struct RustContact: Identifiable {
     var id: String
@@ -15,6 +16,16 @@ struct RustMessage: Identifiable {
     var delivered: Bool
 }
 
+struct RustTransfer: Identifiable {
+    var id: String
+    var peer: String
+    var name: String
+    var size: Int64
+    var received: Int64 = 0
+    var state: String
+    var path: String?
+}
+
 final class RustNetwork: ObservableObject {
     @Published var ownID = ""
     @Published var status = "Запуск ядра…"
@@ -24,12 +35,19 @@ final class RustNetwork: ObservableObject {
     @Published var invitation = ""
     @Published var lastRecord = ""
     @Published var ready = false
+    @Published var transfers: [RustTransfer] = []
+    var onCallEvent: (([String:Any]) -> Void)?
+    var onStop: (() -> Void)?
+    private var pendingStaged: URL?
+    private var staged: [String:URL] = [:]
     private var engine: OpaquePointer?
     private var timer: Timer?
 
     deinit {
         timer?.invalidate()
         if let engine { bgl_close(engine) }
+        if let pendingStaged { try? FileManager.default.removeItem(at:pendingStaged) }
+        for folder in staged.values { try? FileManager.default.removeItem(at:folder) }
     }
 
     static func take(_ pointer: UnsafeMutablePointer<CChar>?) -> String? {
@@ -55,10 +73,16 @@ final class RustNetwork: ObservableObject {
     }
 
     func stop() {
+        onStop?()
         timer?.invalidate()
         timer = nil
         if let engine { bgl_close(engine) }
         engine = nil
+        if let pendingStaged { try? FileManager.default.removeItem(at:pendingStaged) }
+        pendingStaged=nil
+        for folder in staged.values { try? FileManager.default.removeItem(at:folder) }
+        staged.removeAll()
+        transfers.removeAll()
         ready = false
         status = "Сеть остановлена"
     }
@@ -84,10 +108,88 @@ final class RustNetwork: ObservableObject {
         return secret
     }
 
-    func send(_ data: [String: Any]) {
+    @discardableResult func send(_ data: [String: Any]) -> Bool {
         guard let engine, let bytes = try? JSONSerialization.data(withJSONObject: data),
-              let json = String(data: bytes, encoding: .utf8) else { return }
-        if bgl_send(engine, json) != 0 { status = Self.take(bgl_last_error()) ?? "Команда недоступна" }
+              let json = String(data: bytes, encoding: .utf8) else { return false }
+        if bgl_send(engine, json) != 0 { status = Self.take(bgl_last_error()) ?? "Команда недоступна"; return false }
+        return true
+    }
+
+    func sendFile(_ url: URL, peer: String) {
+        guard pendingStaged == nil, !peer.isEmpty else { return }
+        let folder = URL.temporaryDirectory.appendingPathComponent("betelgeuse-outgoing-" + UUID().uuidString, isDirectory:true)
+        pendingStaged = folder
+        status = "Подготовка файла…"
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let access = url.startAccessingSecurityScopedResource()
+            defer { if access { url.stopAccessingSecurityScopedResource() } }
+            do {
+                let values = try url.resourceValues(forKeys:[.fileSizeKey,.isRegularFileKey])
+                guard values.isRegularFile == true, let size=values.fileSize, size <= 256 * 1024 * 1024 else {
+                    throw DirectError("Выберите файл до 256 МБ")
+                }
+                try FileManager.default.createDirectory(at:folder,withIntermediateDirectories:true)
+                let copy = folder.appendingPathComponent("payload")
+                try FileManager.default.copyItem(at:url,to:copy)
+                DispatchQueue.main.async {
+                    guard let self, self.pendingStaged == folder else { try? FileManager.default.removeItem(at:folder); return }
+                    if !self.send(["op":"file_send","peer":peer,"path":copy.path,"name":url.lastPathComponent]) {
+                        self.pendingStaged=nil
+                        try? FileManager.default.removeItem(at:folder)
+                    }
+                }
+            } catch {
+                try? FileManager.default.removeItem(at:folder)
+                DispatchQueue.main.async { self?.pendingStaged=nil; self?.status=error.localizedDescription }
+            }
+        }
+    }
+
+    func fileCommand(_ verb:String, _ item:RustTransfer) {
+        send(["op":"file_"+verb,"peer":item.peer,"id":item.id])
+    }
+
+    private func updateTransfer(_ id:String, mutate:(inout RustTransfer)->Void) {
+        if let index=transfers.firstIndex(where:{$0.id==id}) { mutate(&transfers[index]) }
+    }
+
+    private func fileEvent(_ event:[String:Any]) {
+        let kind=event["event"] as? String ?? ""
+        if kind=="file_prepare_failed" {
+            if let pendingStaged { try? FileManager.default.removeItem(at:pendingStaged) }
+            pendingStaged=nil
+            status=event["error"] as? String ?? "Ошибка файла"
+            return
+        }
+        if kind=="file_action_failed" || kind=="file_ack_failed" {
+            status=event["error"] as? String ?? "Ошибка файла"
+            return
+        }
+        if kind=="files" {
+            for item in event["files"] as? [[String:Any]] ?? [] {
+                var value=item; value["event"]="file_received"; fileEvent(value)
+            }
+            return
+        }
+        guard let id=event["id"] as? String, let peer=event["peer"] as? String else { return }
+        switch kind {
+        case "file_offer", "file_offered", "file_received":
+            let name=event["name"] as? String ?? "Файл"
+            let size=event["size"] as? Int64 ?? 0
+            let state=kind=="file_offer" ? "offer" : kind=="file_offered" ? "sent_offer" : "received"
+            let transfer=RustTransfer(id:id,peer:peer,name:name,size:size,received:state=="received" ? size : 0,state:state,path:event["path"] as? String)
+            transfers.removeAll{$0.id==id};transfers.insert(transfer,at:0)
+            if kind=="file_offered", let folder=pendingStaged { staged[id]=folder; pendingStaged=nil }
+        case "file_started": updateTransfer(id) { $0.state="receiving" }
+        case "file_progress":
+            updateTransfer(id) { item in item.received=event["received"] as? Int64 ?? item.received; item.state=(event["active"] as? Bool == false) ? "paused" : "receiving" }
+        case "file_paused": updateTransfer(id) { $0.state="paused" }
+        case "file_delivered","file_failed","file_cancelled":
+            updateTransfer(id) { $0.state=kind=="file_delivered" ? "delivered" : kind=="file_failed" ? "failed" : "cancelled" }
+            if let folder=staged.removeValue(forKey:id) { try? FileManager.default.removeItem(at:folder) }
+            if let error=event["error"] as? String { status=error }
+        default: break
+        }
     }
 
     func choose(_ contact: String) {
@@ -111,6 +213,7 @@ final class RustNetwork: ObservableObject {
                 status = "Узел запущен"
                 ready = true
                 send(["op": "contacts"])
+                send(["op": "files"])
             case "listen":
                 if let address = event["address"] as? String, address.contains("/p2p-circuit/") { status = "Маршрут через relay готов" }
             case "connected":
@@ -121,6 +224,7 @@ final class RustNetwork: ObservableObject {
                 status = "Ретранслятор доступен"
             case "connection_error", "error", "fatal":
                 status = event["error"] as? String ?? "Ошибка сети"
+                if event["event"] as? String == "fatal" { onStop?() }
                 if event["event"] as? String == "fatal" { ready = false }
             case "invite":
                 invitation = event["link"] as? String ?? ""
@@ -141,6 +245,8 @@ final class RustNetwork: ObservableObject {
                 } else { status = "Запись не найдена" }
             case "put":
                 status = event["ok"] as? Bool == true ? "Запись опубликована" : "Публикация не подтверждена"
+            case "call_signal","call_delivery": onCallEvent?(event)
+            case "file_offer","file_offered","file_received","file_progress","file_paused","file_delivered","file_failed","file_cancelled","file_prepare_failed","file_action_failed","file_started","file_ack_failed","files": fileEvent(event)
             case "queued", "message", "delivery": refresh()
             case "history":
                 if event["peer"] as? String == selected {
@@ -158,6 +264,12 @@ final class RustNetwork: ObservableObject {
 
 struct RustNetworkView: View {
     @StateObject private var core = RustNetwork()
+    @StateObject private var call = RustCall()
+    @AppStorage("rust.ice") private var ice = ""
+    @State private var turnUser=""
+    @State private var turnPassword=""
+    @State private var pickingFile=false
+    private var settings:CallIceSettings { CallIceSettings(urls:ice,username:turnUser,password:turnPassword) }
     @AppStorage("rust.displayname") private var name = ""
     @AppStorage("rust.bootstrap") private var bootstrap = ""
     @State private var input = ""
@@ -210,8 +322,33 @@ struct RustNetworkView: View {
                         }
                     }
                 }.disabled(!core.ready)
+                Section("WebRTC") {
+                    TextField("STUN/TURN URL (необязательно)",text:$ice).textInputAutocapitalization(.never).autocorrectionDisabled()
+                    TextField("TURN логин",text:$turnUser).textInputAutocapitalization(.never)
+                    SecureField("TURN пароль",text:$turnPassword)
+                    if !call.status.isEmpty { Text(call.status).foregroundStyle(.secondary) }
+                    if call.active {
+                        if call.phase == .incoming { Button("Ответить",action:call.answer) }
+                        if let remote=call.remoteVideo { RustVideo(track:remote).frame(height:260).background(.black) }
+                        if let local=call.localVideo { RustVideo(track:local).frame(height:120).background(.black) }
+                        if call.phase == .connected || call.phase == .connecting {
+                            HStack {
+                                Button(call.muted ? "Включить микрофон" : "Выключить микрофон",action:call.toggleMute)
+                                if call.video { Button(call.cameraDisabled ? "Включить камеру" : "Выключить камеру",action:call.toggleCamera) }
+                            }.buttonStyle(.borderless)
+                        }
+                        Button(call.phase == .incoming ? "Отклонить" : "Завершить",role:.destructive,action:call.hangup)
+                    } else if !core.selected.isEmpty {
+                        HStack {
+                            Button("Аудиозвонок") { call.dial(core.selected,video:false,settings:settings) }
+                            Button("Видеозвонок") { call.dial(core.selected,video:true,settings:settings) }
+                        }.buttonStyle(.borderless)
+                    }
+                }.disabled(!core.ready)
                 if !core.selected.isEmpty {
                     Section("Чат") {
+                        Button("Обновить маршрут контакта") { core.send(["op":"get","peer":core.selected,"kind":"routes"]) }
+                        Button("Отправить файл") { pickingFile=true }
                         ForEach(core.messages) { message in
                             HStack {
                                 if message.mine { Spacer() }
@@ -227,10 +364,53 @@ struct RustNetworkView: View {
                         Button("Повторить отправку") { core.send(["op":"retry","peer":core.selected]) }
                     }
                 }
+                if !core.transfers.isEmpty {
+                    Section("Файлы") {
+                        ForEach(core.transfers) { item in
+                            VStack(alignment:.leading,spacing:7) {
+                                Text(item.name).font(.headline)
+                                Text(ByteCountFormatter.string(fromByteCount:item.size,countStyle:.file)).font(.caption)
+                                switch item.state {
+                                case "offer":
+                                    HStack {
+                                        Button("Принять") { core.fileCommand("accept",item) }
+                                        Button("Отклонить",role:.destructive) { core.fileCommand("cancel",item) }
+                                    }.buttonStyle(.borderless)
+                                case "receiving", "paused":
+                                    ProgressView(value:Double(item.received),total:Double(max(item.size,1)))
+                                    HStack {
+                                        Button(item.state=="paused" ? "Продолжить" : "Пауза") { core.fileCommand(item.state=="paused" ? "resume" : "pause",item) }
+                                        Button("Отмена",role:.destructive) { core.fileCommand("cancel",item) }
+                                    }.buttonStyle(.borderless)
+                                case "received":
+                                    if let path=item.path { ShareLink(item:URL(fileURLWithPath:path)) { Label("Сохранить файл",systemImage:"square.and.arrow.up") } }
+                                case "sent_offer":
+                                    Text("Ожидает получателя").foregroundStyle(.secondary)
+                                    Button("Отмена",role:.destructive) { core.fileCommand("cancel",item) }
+                                case "delivered": Text("Доставлено")
+                                case "cancelled": Text("Отменено")
+                                default: Text("Ошибка передачи").foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                    }
+                }
                 Section { if core.ready { Button("Остановить сеть", action:core.stop) } else { Button("Запустить сеть", action:core.start) } }
             }
             .navigationTitle("Бетельгейзе")
-            .onAppear { core.start() }
+            .fileImporter(isPresented:$pickingFile,allowedContentTypes:[.item]) { result in
+                if case .success(let url)=result { core.sendFile(url,peer:core.selected) }
+            }
+            .onAppear {
+                call.sender = { [weak core] in core?.send($0) ?? false }
+                core.onCallEvent = { [weak call] event in call?.receive(event,settings:settings) }
+                core.onStop = { [weak call] in call?.hangup() }
+                core.start()
+            }
+            .onDisappear { call.hangup() }
+            .onChange(of:ice) { _ in core.onCallEvent = { [weak call] event in call?.receive(event,settings:settings) } }
+            .onChange(of:turnUser) { _ in core.onCallEvent = { [weak call] event in call?.receive(event,settings:settings) } }
+            .onChange(of:turnPassword) { _ in core.onCallEvent = { [weak call] event in call?.receive(event,settings:settings) } }
         }
     }
 

@@ -9,7 +9,14 @@ host="$(uname -s | tr '[:upper:]' '[:lower:]')"
 arch="$(uname -m)"
 if [[ "$host" == darwin ]]; then arch=x86_64; fi
 toolchain="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/$host-$arch/bin"
-mkdir -p dist target/mobile-android/lib
+mkdir -p dist target/mobile-android/lib target/webrtc-android
+aar="$root/target/webrtc-android/android-150.7871.01.aar"
+url="https://repo.maven.apache.org/maven2/io/github/webrtc-sdk/android/150.7871.01/android-150.7871.01.aar"
+if [[ ! -f "$aar" ]]; then
+  curl -fL --retry 3 --connect-timeout 20 -o "$aar" "$url"
+fi
+expected="$(curl -fsSL --retry 3 "$url.sha1" | awk '{print $1}')"
+echo "$expected  $aar" | sha1sum -c -
 for target in aarch64-linux-android x86_64-linux-android; do
   case "$target" in
     aarch64-linux-android) abi=arm64-v8a ;;
@@ -26,5 +33,5 @@ for target in aarch64-linux-android x86_64-linux-android; do
   cp "target/$target/release/libbetelgeuse_mobile.so" "target/mobile-android/lib/$abi/"
 done
 
-BETELGEUSE_NATIVE_LIBS="$root/target/mobile-android" BETELGEUSE_UNSIGNED=1 bash clients/android/build.sh
-cp clients/android/Betelgeuse-0.6.0-Android-unsigned.apk dist/
+BETELGEUSE_WEBRTC_AAR="$aar" BETELGEUSE_NATIVE_LIBS="$root/target/mobile-android" BETELGEUSE_UNSIGNED=1 bash clients/android/build.sh
+cp clients/android/Betelgeuse-0.7.0-Android-unsigned.apk dist/
