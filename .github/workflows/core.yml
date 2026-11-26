@@ -74,7 +74,7 @@ jobs:
             Cargo.lock
 
   ios:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/native-call-ui-0.8.2'
     name: iOS IPA and XCFramework
     runs-on: macos-15
     timeout-minutes: 35
@@ -114,7 +114,7 @@ jobs:
           if-no-files-found: error
 
   android:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/native-call-ui-0.8.2'
     name: Android JNI and APK
     runs-on: ubuntu-latest
     timeout-minutes: 35
