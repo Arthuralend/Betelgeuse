@@ -94,23 +94,20 @@ jobs:
 
   android:
     name: Android JNI and APK
-    needs: verify
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          name: betelgeuse-cli-linux
-          path: linux-ci
-      - name: Use tested lockfile
-        run: cp linux-ci/Cargo.lock Cargo.lock
       - name: Rust toolchain
         run: rustup update stable && rustup default stable
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
+      - uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: "11076708"
+          packages: "platform-tools"
       - name: Android SDK and NDK
         run: |
           sdkmanager --install "platforms;android-34" "build-tools;34.0.0" "ndk;28.2.13676358"
