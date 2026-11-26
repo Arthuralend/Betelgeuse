@@ -275,7 +275,7 @@ impl Node {
             }
             Command::Contacts => self.emit(json!({"event":"contacts", "contacts":self.store.contacts()?})).await?,
             Command::History { peer } => {
-                let peer = peer.parse()?;
+                let peer: PeerId = peer.parse()?;
                 self.emit(json!({"event":"history","peer":peer.to_string(),"messages":self.store.history(&peer)?})).await?;
             }
             Command::Send { peer, text } => {
