@@ -74,7 +74,12 @@ public final class RustActivity extends Activity {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private TextView status, identity;
     private EditText name, bootstrap, inviteInput, peerInput, draft;
-    private LinearLayout contacts, messages, inviteActions, chat;
+    private LinearLayout contacts, messages, inviteActions, chat, landing;
+    private ScrollView settingsPane, messageScroll;
+    private TextView chatTitle;
+    private EditText contactSearch;
+    private String currentFilter="";
+    private final LinkedHashMap<String,String> previews=new LinkedHashMap<>();
     private String ownID = "", chosen = "", invitation = "";
     private File qrFile;
     private final Runnable polling = new Runnable() {
@@ -99,7 +104,9 @@ public final class RustActivity extends Activity {
         content.setBackgroundColor(0xff10111a);
         content.setPadding(dp(16), dp(16), dp(16), dp(24));
         scroll.addView(content);
-        setContentView(scroll);
+        LinearLayout screen=column();screen.setBackgroundColor(0xff10111a);setContentView(screen);
+        settingsPane=scroll;screen.addView(settingsPane,new LinearLayout.LayoutParams(-1,0,1));settingsPane.setVisibility(View.GONE);
+        button(content,"‹  Чаты",this::showChats);
         TextView title = label("Бетельгейзе · P2P"); title.setTextSize(25); content.addView(title);
         status = label("Запуск ядра…");content.addView(status);
         networkStatus=label("Ожидание сети");content.addView(networkStatus);
@@ -140,31 +147,39 @@ public final class RustActivity extends Activity {
         button(advancedPanel, "Добавить контакт", () -> command("import", "link", str(inviteInput)));
         peerInput = input(advancedPanel, "Поиск по Peer ID");
         button(advancedPanel, "Найти в DHT", () -> command("get", "peer", str(peerInput)));
-        content.addView(label("WebRTC"));
+        content.addView(label("Голосовой маршрут · STUN/TURN"));
         iceUrls=input(content,"STUN/TURN URL (необязательно)");
         iceUrls.setText(getPreferences(MODE_PRIVATE).getString("iceUrls",""));
         iceUser=input(content,"TURN логин");
         icePassword=input(content,"TURN пароль");
         icePassword.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
-        callPanel=column();content.addView(callPanel);
-        content.addView(label("Контакты"));
-        contacts = column(); content.addView(contacts);
-        chat = column();
-        button(chat,"Аудиозвонок",()->dial(false));
-        button(chat,"Видеозвонок",()->dial(true));
-        button(chat,"Обновить маршрут контакта",()->command("get","peer",chosen,"kind","routes"));
-        button(chat,"Отправить файл",this::pickFile);
-        messages = column(); chat.addView(messages);
-        draft = input(chat, "Сообщение");
-        button(chat, "Отправить", () -> {
-            if (chosen.isEmpty()) return;
-            command("send", "peer", chosen, "text", str(draft)); draft.setText("");
-        });
-        button(chat, "Повторить отправку", () -> command("retry", "peer", chosen));
-        chat.setVisibility(View.GONE); content.addView(chat);
         filePanel=column();content.addView(filePanel);
-        call=new RustRtc(this,(peer,id,signal)->command("call_signal","peer",peer,"id",id,"signal",signal),this::renderCall);
         button(content, "Открыть совместимый режим 0.3", () -> startActivity(new Intent(this, MainActivity.class)));
+        landing=column();landing.setPadding(dp(16),dp(12),dp(16),dp(12));screen.addView(landing,new LinearLayout.LayoutParams(-1,0,1));
+        LinearLayout listHeader=new LinearLayout(this);listHeader.setGravity(Gravity.CENTER_VERTICAL);landing.addView(listHeader);
+        TextView brand=label("Бетельгейзе");brand.setTextSize(26);brand.setTextColor(0xffffa855);listHeader.addView(brand,new LinearLayout.LayoutParams(0,-2,1));
+        button(listHeader,"Настройки",this::showSettings);
+        button(landing,"＋  Добавить контакт",()->{showSettings();advancedPanel.setVisibility(View.VISIBLE);});
+        contactSearch=input(landing,"Поиск контактов");
+        contactSearch.addTextChangedListener(new android.text.TextWatcher(){
+            public void beforeTextChanged(CharSequence t,int a,int c,int f){}
+            public void onTextChanged(CharSequence t,int a,int b,int c){currentFilter=t.toString();renderContacts();}
+            public void afterTextChanged(android.text.Editable e){}
+        });
+        ScrollView contactScroll=new ScrollView(this);contacts=column();contactScroll.addView(contacts);landing.addView(contactScroll,new LinearLayout.LayoutParams(-1,0,1));
+        chat=column();chat.setPadding(dp(10),dp(8),dp(10),dp(10));screen.addView(chat,new LinearLayout.LayoutParams(-1,0,1));chat.setVisibility(View.GONE);
+        LinearLayout header=new LinearLayout(this);header.setGravity(Gravity.CENTER_VERTICAL);chat.addView(header);
+        button(header,"‹",this::showChats);
+        chatTitle=label("Переписка");chatTitle.setTextSize(20);header.addView(chatTitle,new LinearLayout.LayoutParams(0,-2,1));
+        button(header,"☎",()->dial(false));button(header,"Видео",()->dial(true));
+        Button more=new Button(this);more.setText("⋯");header.addView(more);more.setOnClickListener(v->{android.widget.PopupMenu menu=new android.widget.PopupMenu(this,v);menu.getMenu().add("Обновить маршрут").setOnMenuItemClickListener(i->{command("get","peer",chosen,"kind","routes");return true;});menu.getMenu().add("Повторить отправку").setOnMenuItemClickListener(i->{command("retry","peer",chosen);return true;});menu.show();});
+        callPanel=column();chat.addView(callPanel);
+        messageScroll=new ScrollView(this);messages=column();messageScroll.addView(messages);chat.addView(messageScroll,new LinearLayout.LayoutParams(-1,0,1));
+        LinearLayout composer=new LinearLayout(this);composer.setGravity(Gravity.CENTER_VERTICAL);chat.addView(composer);
+        button(composer,"＋",this::pickFile);
+        draft=new EditText(this);draft.setTextColor(Color.WHITE);draft.setHintTextColor(0xffb4b4b4);draft.setHint("Сообщение");draft.setMaxLines(5);composer.addView(draft,new LinearLayout.LayoutParams(0,-2,1));
+        button(composer,"➤",()->{if(!chosen.isEmpty()&&!str(draft).trim().isEmpty()){command("send","peer",chosen,"text",str(draft));draft.setText("");}});
+        call=new RustRtc(this,(peer,id,signal)->command("call_signal","peer",peer,"id",id,"signal",signal),this::renderCall);
         nearby=new NearbyDiscovery(this,this::renderNearby);
         startCore();
         connectivity=(ConnectivityManager)getSystemService(CONNECTIVITY_SERVICE);
@@ -311,24 +326,26 @@ public final class RustActivity extends Activity {
                     String peer = item.optString("peer");knownContacts.add(peer);
                     String label = item.isNull("name") ? peer.substring(0, Math.min(12, peer.length())) : item.optString("name");
                     contactNames.put(peer,label);
-                    button(contacts, label, () -> { chosen = peer; chat.setVisibility(View.VISIBLE); messages.removeAllViews(); refresh(); });
+
                 }
-                renderNearby();break;
+                renderContacts();renderNearby();int counted=0;for(String contact:contactNames.keySet()){if(counted++>=30)break;command("history","peer",contact);}break;
             case "queued": case "message": case "delivery":
-                refresh(); break;
+                String changedPeer=event.optString("peer");if(!changedPeer.isEmpty()&&!changedPeer.equals(chosen))command("history","peer",changedPeer);else refresh();break;
             case "history":
-                if (!chosen.equals(event.optString("peer"))) break;
+                String historyPeer=event.optString("peer");JSONArray lines=event.optJSONArray("messages");
+                if(lines!=null&&lines.length()>0){JSONObject last=lines.optJSONObject(lines.length()-1);if(last!=null){previews.put(historyPeer,(last.optBoolean("mine")?"Вы: ":"")+last.optString("text"));renderContacts();}}
+                if (!chosen.equals(historyPeer)) break;
                 messages.removeAllViews();
-                JSONArray lines = event.optJSONArray("messages");
                 if (lines != null) for (int i = 0; i < lines.length(); i++) {
                     JSONObject message = lines.optJSONObject(i);
                     if (message == null) continue;
                     boolean mine = message.optBoolean("mine");
-                    TextView bubble = label((mine ? "Вы: " : "") + message.optString("text") +
-                        (mine ? (message.optBoolean("delivered") ? "  ✓" : "  …") : ""));
-                    bubble.setPadding(dp(8), dp(8), dp(8), dp(8)); messages.addView(bubble);
+                    TextView bubble=label(message.optString("text")+(mine?(message.optBoolean("delivered")?"  ✓":"  …"):""));
+                    bubble.setPadding(dp(12),dp(10),dp(12),dp(10));bubble.setMaxWidth(getResources().getDisplayMetrics().widthPixels*3/4);
+                    GradientDrawable bg=new GradientDrawable();bg.setColor(mine?0xff543522:0xff292a34);bg.setCornerRadius(dp(17));bubble.setBackground(bg);
+                    LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(-2,-2);lp.gravity=mine?Gravity.END:Gravity.START;lp.setMargins(dp(8),dp(5),dp(8),dp(5));messages.addView(bubble,lp);
                 }
-                break;
+                messageScroll.post(()->messageScroll.fullScroll(View.FOCUS_DOWN));break;
             case "put":
                 status.setText(event.optBoolean("ok") ? "Запись опубликована" : "Публикация не подтверждена"); break;
             case "get":
@@ -340,6 +357,24 @@ public final class RustActivity extends Activity {
                 break;
         }
     }
+
+    private void showChats(){settingsPane.setVisibility(View.GONE);chat.setVisibility(View.GONE);landing.setVisibility(View.VISIBLE);}
+    private void showSettings(){landing.setVisibility(View.GONE);chat.setVisibility(View.GONE);settingsPane.setVisibility(View.VISIBLE);}
+    private void openChat(String peer){chosen=peer;chatTitle.setText(contactNames.containsKey(peer)?contactNames.get(peer):peer);landing.setVisibility(View.GONE);settingsPane.setVisibility(View.GONE);chat.setVisibility(View.VISIBLE);messages.removeAllViews();draft.setText("");refresh();}
+    private void renderContacts(){
+        if(contacts==null)return;contacts.removeAllViews();
+        for(java.util.Map.Entry<String,String> item:contactNames.entrySet()){
+            String title=item.getValue(),peer=item.getKey();
+            if(!title.toLowerCase(java.util.Locale.ROOT).contains(currentFilter.toLowerCase(java.util.Locale.ROOT)))continue;
+            LinearLayout row=new LinearLayout(this);row.setGravity(Gravity.CENTER_VERTICAL);row.setPadding(dp(6),dp(12),dp(6),dp(12));
+            TextView avatar=callText(title.isEmpty()?"✦":title.substring(0,1).toUpperCase(java.util.Locale.ROOT),22,0xffffa855);
+            GradientDrawable bg=new GradientDrawable();bg.setColor(0xff3f2424);bg.setShape(GradientDrawable.OVAL);avatar.setBackground(bg);row.addView(avatar,new LinearLayout.LayoutParams(dp(52),dp(52)));
+            LinearLayout names=column();names.setPadding(dp(14),0,0,0);TextView primary=label(title);primary.setTextSize(18);names.addView(primary);TextView sub=label(previews.containsKey(peer)?previews.get(peer):"Открыть переписку");sub.setSingleLine(true);sub.setEllipsize(android.text.TextUtils.TruncateAt.END);sub.setTextColor(0xffa8a5ad);sub.setTextSize(13);names.addView(sub);row.addView(names,new LinearLayout.LayoutParams(0,-2,1));
+            row.setOnClickListener(v->openChat(peer));contacts.addView(row);View divider=new View(this);divider.setBackgroundColor(0xff32323a);contacts.addView(divider,new LinearLayout.LayoutParams(-1,dp(1)));
+        }
+        if(contactNames.isEmpty())contacts.addView(label("Нет контактов. Нажмите «Добавить контакт»."));
+    }
+    @Override public void onBackPressed(){if(chat.getVisibility()==View.VISIBLE||settingsPane.getVisibility()==View.VISIBLE){showChats();return;}super.onBackPressed();}
 
     private void dial(boolean video){
         if(call==null||chosen.isEmpty())return;

@@ -38,6 +38,7 @@ final class RustNetwork: ObservableObject {
     @Published var status = "Запуск ядра…"
     @Published var contacts: [RustContact] = []
     @Published var messages: [RustMessage] = []
+    @Published var previews: [String:String] = [:]
     @Published var selected = ""
     @Published var invitation = ""
     @Published var lastRecord = ""
@@ -338,6 +339,7 @@ final class RustNetwork: ObservableObject {
                     guard let peer = item["peer"] as? String else { return nil }
                     return RustContact(id: peer, name: item["name"] as? String ?? String(peer.prefix(12)))
                 }
+                for contact in contacts.prefix(30) { send(["op":"history","peer":contact.id]) }
             case "get":
                 if event["ok"] as? Bool == true {
                     let record = event["record"] as? [String: Any]
@@ -350,14 +352,18 @@ final class RustNetwork: ObservableObject {
                 status = event["ok"] as? Bool == true ? "Запись опубликована" : "Публикация не подтверждена"
             case "call_signal","call_delivery": onCallEvent?(event)
             case "file_offer","file_offered","file_received","file_progress","file_paused","file_delivered","file_failed","file_cancelled","file_prepare_failed","file_action_failed","file_started","file_ack_failed","files": fileEvent(event)
-            case "queued", "message", "delivery": refresh()
+            case "queued", "message", "delivery":
+                if let peer=event["peer"] as? String,peer != selected { send(["op":"history","peer":peer]) }
+                else { refresh() }
             case "history":
-                if event["peer"] as? String == selected {
-                    messages = (event["messages"] as? [[String: Any]] ?? []).compactMap { item in
+                if let peer=event["peer"] as? String {
+                    let history: [RustMessage] = (event["messages"] as? [[String: Any]] ?? []).compactMap { item in
                         guard let id = item["id"] as? String, let text = item["text"] as? String else { return nil }
                         return RustMessage(id: id, text: text, mine: item["mine"] as? Bool ?? false,
                                            delivered: item["delivered"] as? Bool ?? false)
                     }
+                    if let last=history.last { previews[peer]=(last.mine ? "Вы: " : "")+last.text }
+                    if peer == selected { messages=history }
                 }
             default: break
             }
@@ -381,6 +387,11 @@ struct RustNetworkView: View {
     @State private var turnUser=""
     @State private var turnPassword=""
     @State private var pickingFile=false
+    @State private var settingsOpen=false
+    @State private var chatOpen=false
+    @State private var search=""
+    private var accent:Color { Color(red: 0.97,green:0.53,blue:0.22) }
+    private var selectedName:String { core.contacts.first(where:{$0.id==core.selected})?.name ?? "Переписка" }
     private var settings:CallIceSettings { CallIceSettings(urls:ice,username:turnUser,password:turnPassword) }
     @AppStorage("rust.displayname") private var name = ""
     @State private var bootstrap = ""
@@ -422,7 +433,9 @@ struct RustNetworkView: View {
     }
     var body: some View {
         NavigationStack {
-            List {
+            Group {
+                if chatOpen { conversation }
+                else if settingsOpen { List {
                 Section("Сеть") {
                     Label(core.ready ? core.networkStatus : core.status,systemImage:core.ready ? "network" : "exclamationmark.circle")
                         .foregroundStyle(core.ready ? Color.green : Color.secondary)
@@ -506,45 +519,14 @@ struct RustNetworkView: View {
                     TextField("Поиск по Peer ID", text: $peer).textInputAutocapitalization(.never).autocorrectionDisabled()
                     Button("Найти в DHT") { core.send(["op":"get","peer":peer]); }
                     if !core.lastRecord.isEmpty { Text(core.lastRecord) }
-                    ForEach(core.contacts) { contact in
-                        Button {
-                            core.choose(contact.id)
-                        } label: {
-                            HStack { Text(contact.name); Spacer(); if core.selected == contact.id { Image(systemName: "checkmark") } }
-                        }
-                    }
                 }.disabled(!core.ready)
-                Section("WebRTC") {
-                    TextField("STUN/TURN URL (необязательно)",text:$ice).textInputAutocapitalization(.never).autocorrectionDisabled()
+                Section("Голосовой маршрут") {
+                    TextField("STUN/TURN URL",text:$ice).textInputAutocapitalization(.never).autocorrectionDisabled()
                     TextField("TURN логин",text:$turnUser).textInputAutocapitalization(.never)
                     SecureField("TURN пароль",text:$turnPassword)
+                    if ice.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty { Text("Без STUN/TURN звонки между разными сетями могут не соединиться.").font(.caption).foregroundStyle(.orange) }
                     if !call.status.isEmpty { Text(call.status).foregroundStyle(.secondary) }
-                    if !call.active && !core.selected.isEmpty {
-                        HStack {
-                            Button("Аудиозвонок") { call.dial(core.selected,video:false,settings:settings) }
-                            Button("Видеозвонок") { call.dial(core.selected,video:true,settings:settings) }
-                        }.buttonStyle(.borderless)
-                    }
                 }.disabled(!core.ready)
-                if !core.selected.isEmpty {
-                    Section("Чат") {
-                        Button("Обновить маршрут контакта") { core.send(["op":"get","peer":core.selected,"kind":"routes"]) }
-                        Button("Отправить файл") { pickingFile=true }
-                        ForEach(core.messages) { message in
-                            HStack {
-                                if message.mine { Spacer() }
-                                VStack(alignment: .leading) {
-                                    Text(message.text)
-                                    if message.mine { Text(message.delivered ? "Доставлено" : "В очереди").font(.caption2).foregroundStyle(.secondary) }
-                                }.padding(8).background(Color.secondary.opacity(0.15), in: RoundedRectangle(cornerRadius: 8))
-                                if !message.mine { Spacer() }
-                            }
-                        }
-                        TextField("Сообщение", text: $text)
-                        Button("Отправить") { core.send(["op":"send","peer":core.selected,"text":text]); text = "" }
-                        Button("Повторить отправку") { core.send(["op":"retry","peer":core.selected]) }
-                    }
-                }
                 if !core.transfers.isEmpty {
                     Section("Файлы") {
                         ForEach(core.transfers) { item in
@@ -578,7 +560,19 @@ struct RustNetworkView: View {
                 }
                 Section { if core.ready { Button("Остановить сеть", action:core.stop) } else { Button("Запустить сеть", action:core.start).disabled(core.starting) } }
             }
-            .navigationTitle("Бетельгейзе")
+                } else { conversationList }
+            }
+            .navigationTitle(chatOpen ? selectedName : settingsOpen ? "Настройки" : "Бетельгейзе")
+            .navigationBarTitleDisplayMode(chatOpen ? .inline : .large)
+            .tint(accent)
+            .toolbar {
+                if chatOpen || settingsOpen { ToolbarItem(placement:.navigationBarLeading) { Button { chatOpen=false;settingsOpen=false } label:{ Image(systemName:"chevron.left") } } }
+                if chatOpen { ToolbarItemGroup(placement:.navigationBarTrailing) {
+                    Button { call.dial(core.selected,video:false,settings:settings) } label:{ Image(systemName:"phone.fill") }.disabled(!core.ready || call.active)
+                    Button { call.dial(core.selected,video:true,settings:settings) } label:{ Image(systemName:"video.fill") }.disabled(!core.ready || call.active)
+                    Menu { Button("Обновить маршрут"){core.send(["op":"get","peer":core.selected,"kind":"routes"])}; Button("Повторить отправку"){core.send(["op":"retry","peer":core.selected])}; Button("Переданные файлы"){chatOpen=false;settingsOpen=true} } label:{Image(systemName:"ellipsis.circle")}
+                } } else if !settingsOpen { ToolbarItem(placement:.navigationBarTrailing) { Button { settingsOpen=true } label:{ Image(systemName:"gearshape.fill") } } }
+            }
             .fileImporter(isPresented:$pickingFile,allowedContentTypes:[.item]) { result in
                 if case .success(let url)=result { core.sendFile(url,peer:core.selected) }
             }
@@ -611,6 +605,54 @@ struct RustNetworkView: View {
             .onChange(of:ice) { _ in core.onCallEvent = { [weak call] event in call?.receive(event,settings:settings) } }
             .onChange(of:turnUser) { _ in core.onCallEvent = { [weak call] event in call?.receive(event,settings:settings) } }
             .onChange(of:turnPassword) { _ in core.onCallEvent = { [weak call] event in call?.receive(event,settings:settings) } }
+        }
+    }
+
+    private var conversationList: some View {
+        VStack(spacing:0) {
+            HStack { Circle().fill(core.ready ? Color.green : .gray).frame(width:9,height:9); Text(core.ready ? core.networkStatus : core.status).font(.caption); Spacer(); Button {settingsOpen=true} label:{Label("Добавить",systemImage:"person.badge.plus").font(.subheadline)} }.padding(.horizontal).padding(.vertical,10)
+            HStack { Image(systemName:"magnifyingglass").foregroundStyle(.secondary); TextField("Поиск контактов",text:$search) }.padding(12).background(.thinMaterial,in:RoundedRectangle(cornerRadius:14)).padding(.horizontal)
+            if core.contacts.isEmpty { Spacer(); Image(systemName:"bubble.left.and.bubble.right").font(.system(size:45)).foregroundStyle(accent); Text("Нет контактов").font(.headline).padding(.top); Button("Добавить контакт"){settingsOpen=true}.padding(); Spacer() }
+            else { ScrollView { LazyVStack(spacing:0) {
+                ForEach(core.contacts.filter{search.isEmpty || $0.name.localizedCaseInsensitiveContains(search)}) { contact in
+                    Button { text="";core.choose(contact.id);chatOpen=true } label:{
+                        HStack(spacing:14) {
+                            ZStack { Circle().fill(accent.opacity(0.17)).frame(width:52,height:52); Text(String(contact.name.prefix(1)).uppercased()).font(.title2.bold()).foregroundStyle(accent) }
+                            VStack(alignment:.leading,spacing:5){Text(contact.name).font(.headline).foregroundStyle(.primary);Text(core.previews[contact.id] ?? "Открыть переписку").font(.subheadline).foregroundStyle(.secondary).lineLimit(1)}
+                            Spacer();Image(systemName:"chevron.right").font(.caption).foregroundStyle(.secondary)
+                        }.padding(.horizontal).padding(.vertical,14)
+                    }.buttonStyle(.plain)
+                    Divider().padding(.leading,80)
+                }
+            }} }
+        }
+    }
+    private var conversation: some View {
+        VStack(spacing:0) {
+            if !call.status.isEmpty && !call.active {Text(call.status).font(.caption).foregroundStyle(.secondary).padding(8)}
+            ScrollViewReader { proxy in
+                ScrollView { LazyVStack(spacing:12) {
+                    ForEach(core.messages) { message in
+                        HStack {
+                            if message.mine { Spacer(minLength:42) }
+                            VStack(alignment:.leading,spacing:5) {
+                                Text(message.text).textSelection(.enabled)
+                                if message.mine {Text(message.delivered ? "Доставлено ✓" : "В очереди").font(.caption2).foregroundStyle(.secondary)}
+                            }.padding(12).background(message.mine ? accent.opacity(0.23) : Color.secondary.opacity(0.16),in:RoundedRectangle(cornerRadius:17))
+                            if !message.mine { Spacer(minLength:42) }
+                        }.id(message.id)
+                    }
+                    Color.clear.frame(height:1).id("chat-bottom")
+                }.padding(14) }
+                .onAppear{proxy.scrollTo("chat-bottom",anchor:.bottom)}
+                .onChange(of:core.messages.last?.id){_ in proxy.scrollTo("chat-bottom",anchor:.bottom)}
+            }
+            Divider()
+            HStack(spacing:12) {
+                Button { pickingFile=true } label:{ Image(systemName:"paperclip").font(.title2) }
+                TextField("Сообщение",text:$text,axis:.vertical).lineLimit(1...5).padding(10).background(.thinMaterial,in:RoundedRectangle(cornerRadius:18))
+                Button { if !text.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty { core.send(["op":"send","peer":core.selected,"text":text]);text="" } } label:{ Image(systemName:"arrow.up.circle.fill").font(.system(size:35)) }.disabled(text.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty || !core.ready)
+            }.padding(12)
         }
     }
 

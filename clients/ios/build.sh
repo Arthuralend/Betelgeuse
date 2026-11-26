@@ -47,9 +47,9 @@ swiftc -parse-as-library -sdk "$SDK" -target "$TARGET" -O -swift-version 5 \
 if [ "$MODE" != "simulator" ]; then
   mkdir -p build/ipa/Payload
   cp -R "$OUT" build/ipa/Payload/
-  rm -f Betelgeuse-0.8.2-iPhone-unsigned.ipa
-  (cd build/ipa && zip -qry ../../Betelgeuse-0.8.2-iPhone-unsigned.ipa Payload)
-  echo "Built: $(pwd)/Betelgeuse-0.8.2-iPhone-unsigned.ipa"
+  rm -f Betelgeuse-0.8.3-iPhone-unsigned.ipa
+  (cd build/ipa && zip -qry ../../Betelgeuse-0.8.3-iPhone-unsigned.ipa Payload)
+  echo "Built: $(pwd)/Betelgeuse-0.8.3-iPhone-unsigned.ipa"
 else
   echo "Built: $(pwd)/$OUT"
 fi

@@ -74,7 +74,7 @@ jobs:
             Cargo.lock
 
   ios:
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/native-call-ui-0.8.2'
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/chat-ui-0.8.3'
     name: iOS IPA and XCFramework
     runs-on: macos-15
     timeout-minutes: 35
@@ -110,11 +110,11 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: betelgeuse-ios
-          path: dist/Betelgeuse-0.8.2-iPhone-unsigned.ipa
+          path: dist/Betelgeuse-0.8.3-iPhone-unsigned.ipa
           if-no-files-found: error
 
   android:
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/native-call-ui-0.8.2'
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feature/chat-ui-0.8.3'
     name: Android JNI and APK
     runs-on: ubuntu-latest
     timeout-minutes: 35
@@ -139,7 +139,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: betelgeuse-android
-          path: dist/Betelgeuse-0.8.2-Android-unsigned.apk
+          path: dist/Betelgeuse-0.8.3-Android-unsigned.apk
           if-no-files-found: error
 
   media:
