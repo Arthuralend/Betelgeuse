@@ -70,27 +70,41 @@ jobs:
 
   ios:
     name: iOS IPA and XCFramework
-    needs: verify
     runs-on: macos-15
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          name: betelgeuse-cli-linux
-          path: linux-ci
-      - name: Use tested lockfile
-        run: cp linux-ci/Cargo.lock Cargo.lock
+      - name: Select Xcode with iOS 26 SDK
+        run: |
+          developer_dir="$(python3 - <<'PYX'
+          from pathlib import Path
+          def version(p):
+              import re
+              return tuple(map(int, re.findall(r'\d+', p.name)))
+          apps = sorted(Path('/Applications').glob('Xcode_26*.app'), key=version)
+          if not apps:
+              raise SystemExit('Xcode 26 is not installed on this runner')
+          print(apps[-1] / 'Contents/Developer')
+          PYX
+          )"
+          echo "DEVELOPER_DIR=$developer_dir" >> "$GITHUB_ENV"
+          export DEVELOPER_DIR="$developer_dir"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
       - name: Rust toolchain
         run: rustup update stable && rustup default stable
       - name: Build Rust XCFramework and iPhone package
         run: bash scripts/build-ios.sh
       - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: betelgeuse-xcframework
+          path: dist/Betelgeuse-Core.xcframework/**
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
         with:
           name: betelgeuse-ios
-          path: |
-            dist/Betelgeuse-Core.xcframework
-            dist/Betelgeuse-0.6.0-iPhone-unsigned.ipa
+          path: dist/Betelgeuse-0.6.0-iPhone-unsigned.ipa
 
   android:
     name: Android JNI and APK
