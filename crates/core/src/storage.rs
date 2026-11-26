@@ -148,6 +148,18 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    pub fn history(&self, peer: &PeerId) -> Result<Vec<serde_json::Value>> {
+        let mut stmt = self.0.prepare("SELECT id,text,direction,delivered FROM messages
+            WHERE peer=?1 ORDER BY created DESC,rowid DESC LIMIT 100")?;
+        let rows = stmt.query_map([peer.to_string()], |r| {
+            Ok(serde_json::json!({"id":r.get::<_,String>(0)?, "text":r.get::<_,String>(1)?,
+                "mine":r.get::<_,i64>(2)? == 1, "delivered":r.get::<_,i64>(3)? == 1}))
+        })?;
+        let mut result = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        result.reverse();
+        Ok(result)
+    }
+
     pub fn delivered(&self, peer: &PeerId, id: &str) -> Result<()> {
         self.0.execute("UPDATE messages SET delivered=1 WHERE peer=?1 AND direction=1 AND id=?2",
             params![peer.to_string(), id])?;

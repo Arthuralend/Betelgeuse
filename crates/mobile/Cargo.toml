@@ -1,0 +1,22 @@
+[package]
+name = "betelgeuse-mobile"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "betelgeuse_mobile"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+betelgeuse-core = { path = "../core" }
+libp2p.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"

@@ -50,6 +50,7 @@ pub enum Command {
     Invite { name: Option<String>, addresses: Option<Vec<String>>, qr_path: Option<String> },
     Import { link: String },
     Contacts,
+    History { peer: String },
     Send { peer: String, text: String },
     Retry { peer: String },
     Status,
@@ -164,7 +165,10 @@ impl Node {
         if let Some(addresses) = provided {
             return addresses.into_iter().map(|s| s.parse().map_err(anyhow::Error::from)).collect();
         }
-        Ok(self.swarm.listeners().take(8).cloned().map(|a| self.normalize_listener(a)).collect())
+        let mut addresses: Vec<_> = self.swarm.listeners().cloned().map(|a| self.normalize_listener(a)).collect();
+        addresses.sort_by_key(|address| !address.iter().any(|part| part == Protocol::P2pCircuit));
+        addresses.truncate(8);
+        Ok(addresses)
     }
 
     fn profile(&mut self, name: Option<String>) -> Result<SignedRecord> {
@@ -270,6 +274,10 @@ impl Node {
                 self.emit(json!({"event":"contact", "contact":contact})).await?;
             }
             Command::Contacts => self.emit(json!({"event":"contacts", "contacts":self.store.contacts()?})).await?,
+            Command::History { peer } => {
+                let peer = peer.parse()?;
+                self.emit(json!({"event":"history","peer":peer.to_string(),"messages":self.store.history(&peer)?})).await?;
+            }
             Command::Send { peer, text } => {
                 let peer: PeerId = peer.parse()?;
                 let message = self.store.queue(&peer, text)?;

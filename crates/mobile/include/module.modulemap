@@ -1,0 +1,4 @@
+module BetelgeuseCore {
+  header "BetelgeuseCore.h"
+  export *
+}
